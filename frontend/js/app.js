@@ -1493,6 +1493,18 @@
     return t("providers.testDone");
   }
 
+  // 测速结果是否要 UI 标黄(.bad class)。**白名单语义**(silent-failure-hunter
+  // review H2):后端将来加新 authStatus 枚举(`tls_warn` / `rate_limited` /
+  // `cert_expired` 等)/ 或返 `success: false` 不带 ok 字段,helper 默认标黄不漏判。
+  // 只有显式"全 OK"才标绿:result 存在 + ok!==false + (无 authStatus 或 authStatus==="ok")。
+  function isProviderTestResultBad(result) {
+    if (!result) return true;
+    if (result.success === false) return true;
+    if (result.ok === false) return true;
+    if (result.authStatus && result.authStatus !== "ok") return true;
+    return false;
+  }
+
   function formatModelFetchError(error) {
     const reason = error?.message || t("toast.requestFailed");
     return `${t("models.fetchFailedManual")}: ${reason}`;
@@ -1705,7 +1717,7 @@
           const message = formatProviderTestResult(result);
           if (resultEl) {
             resultEl.textContent = message;
-            resultEl.classList.toggle("bad", result.ok === false);
+            resultEl.classList.toggle("bad", isProviderTestResultBad(result));
           }
           showToast(message);
         } catch (error) {
@@ -1766,7 +1778,7 @@
           const result = await CCApi.testProviderPayload(payload);
           const message = formatProviderTestResult(result);
           resultEl.textContent = message;
-          resultEl.classList.toggle("bad", result.ok === false);
+          resultEl.classList.toggle("bad", isProviderTestResultBad(result));
           showToast(message);
         } catch (error) {
           const message = error?.message || t("toast.requestFailed");
