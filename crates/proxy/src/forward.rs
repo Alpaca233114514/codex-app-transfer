@@ -250,15 +250,14 @@ pub async fn forward_handler(
     let adapter = state
         .adapters
         .lookup_for_request(&resolved.provider.api_format, &client_path);
-    let plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
+    // 保留一份原始 body_bytes(model 已 rewrite + strip 过),供 web_search
+    // transparent retry 路径重新调用 prepare_request 用 —— retry 时 cache 已
+    // disable web_search,prepare_request 会输出不带 web_search 工具的 body。
+    let original_body_bytes_for_retry = body_bytes.clone();
+    let mut plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
-    let path = if plan.upstream_path.starts_with('/') {
-        plan.upstream_path.clone()
-    } else {
-        format!("/{}", plan.upstream_path)
-    };
-    let upstream_url = format!("{}{}", resolved.upstream_base.trim_end_matches('/'), path);
+    let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
     let telemetry = proxy_telemetry();
     telemetry
         .logs
@@ -279,41 +278,83 @@ pub async fn forward_handler(
             .add("INFO", format!("model: {mapped} → {upstream_model}"));
     }
 
-    // 6. 构造 reqwest 请求 —— 头复制 + 鉴权改写 + extras 注入
-    //
-    // **extras 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
-    // 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
-    // `User-Agent: codex-cli/...`)和 `provider.extraHeaders`(例如 kimi-code
-    // 的 `User-Agent: KimiCLI/1.40.0`)同名,两条值都会上线,部分上游
-    // 严格按"首条 UA"判定接入身份就会绕过我们的伪装。这里在复制客户端
-    // header 时,先把 extras 已经覆盖的名字过滤掉,保证最终只有 extras 的
-    // 值出去。
-    let mut up = state
-        .http
-        .request(parts.method.clone(), &upstream_url)
-        .body(plan.body.clone());
-    for (name, value) in parts.headers.iter() {
-        if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
-            continue;
-        }
-        if resolved.extra_headers.contains_key(name) {
-            continue;
-        }
-        up = up.header(name, value);
-    }
-    up = inject_auth(up, &resolved);
-    for (name, value) in resolved.extra_headers.iter() {
-        up = up.header(name, value);
-    }
+    // 6/7. 构造 reqwest 请求 + 发送(抽到 `build_and_send_upstream`,
+    // transparent retry 复用)。
+    let (initial_resp, mut outbound_headers_snapshot) = build_and_send_upstream(
+        &state,
+        &parts.method,
+        &parts.headers,
+        &resolved,
+        &plan.body,
+        &upstream_url,
+    )
+    .await?;
 
-    // 7. build Request → 截取出站 headers 备用诊断 → execute
-    //    拆开 send() 等价于 build()+execute(),只是中间能拿到出站 headers
-    //    用于错误诊断日志(脱敏 Authorization / api-key)。
-    let req = up.build()?;
-    let outbound_headers_snapshot = req.headers().clone();
-    let resp = state.http.execute(req).await?;
-    let status = resp.status();
-    let upstream_headers = filter_hop_headers(resp.headers());
+    // ── A+B web_search transparent retry ──
+    // 上游 web search 拒绝时(MiMo Token Plan 套餐没开 Web Search Plugin):
+    //   { "code": "400", "param": "web search tool found in the request body,
+    //     but webSearchEnabled is false" }
+    // **不能透传 4xx 给 Codex.app** —— 实测它收到 JSON error body 后期待
+    // SSE 流而卡 Thinking,不会让用户看到错误,也不会自动重试触发下一 turn。
+    // 必须 transparent retry:① disable cache → ② 重新 prepare_request(B 层
+    // cache 命中 web_search 被 drop)→ ③ 重发上游 + 用新响应替代 4xx →
+    // 客户端只感知到正常 SSE 流。用户视角:无感降级,session 内后续 turn 都
+    // 不再发 web_search,直到用户在 UI 重新打开开关 / 应用重启。
+    //
+    // 用 Option<Response> + Option<(status, headers, body)> 二选一表示状态:
+    //   live_resp = Some + captured_4xx = None → resp 活着(成功 / 5xx / retry 后)
+    //   live_resp = None + captured_4xx = Some  → 非 web_search 4xx,resp 已消费
+    let mut live_resp: Option<reqwest::Response> = Some(initial_resp);
+    let mut captured_4xx: Option<(http::StatusCode, reqwest::header::HeaderMap, Bytes)> = None;
+    let need_retry_check = live_resp
+        .as_ref()
+        .map(|r| r.status() == http::StatusCode::BAD_REQUEST)
+        .unwrap_or(false);
+    if need_retry_check {
+        let resp = live_resp.take().expect("live_resp is Some by check above");
+        let st = resp.status();
+        let hs = resp.headers().clone();
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        if is_web_search_upstream_reject(&body_bytes) {
+            codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
+            telemetry.logs.add(
+                "WARN",
+                format!(
+                    "auto-disabled web_search for provider {} (upstream rejected: webSearchEnabled=false), retrying without web_search...",
+                    resolved.provider.id
+                ),
+            );
+            // 重新调 prepare_request,B 层 cache 命中 → web_search 被 drop
+            plan = adapter.prepare_request(
+                &client_path,
+                original_body_bytes_for_retry,
+                &resolved.provider,
+            )?;
+            // upstream_url 不变(同一 provider,plan.upstream_path 跟 web_search 无关)
+            let pair = build_and_send_upstream(
+                &state,
+                &parts.method,
+                &parts.headers,
+                &resolved,
+                &plan.body,
+                &upstream_url,
+            )
+            .await?;
+            telemetry.logs.add(
+                "INFO",
+                format!(
+                    "web_search retry status {} for provider {}",
+                    pair.0.status().as_u16(),
+                    resolved.provider.id
+                ),
+            );
+            live_resp = Some(pair.0);
+            outbound_headers_snapshot = pair.1;
+        } else {
+            // 非 web_search 4xx,resp 已被 bytes() 消费,把三元组保存
+            captured_4xx = Some((st, hs, body_bytes));
+        }
+    }
 
     // 4xx / 5xx 诊断:整段缓冲 upstream body,把请求体 + 响应体片段写日志,
     // 然后用同一份字节再造一个 stream 走 adapter / 客户端。错误 body 一般
@@ -324,29 +365,58 @@ pub async fn forward_handler(
     // 辅助定位真实 Codex CLI 流量里"几分钟"是单次 reasoning 慢、还是连续
     // 多轮工具循环放大。
     let t_send = Instant::now();
-    let upstream_stream: codex_app_transfer_adapters::ByteStream = if status.is_success() {
-        let raw = Box::pin(
-            resp.bytes_stream()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-        );
-        Box::pin(TracedStream::new(
-            raw,
-            t_send,
-            status.as_u16(),
-            upstream_url.clone(),
-        ))
-    } else {
-        let body_bytes = resp.bytes().await.unwrap_or_default();
+    let (status, upstream_headers, upstream_stream): (
+        http::StatusCode,
+        HeaderMap,
+        codex_app_transfer_adapters::ByteStream,
+    ) = if let Some((st, hs, body)) = captured_4xx {
+        // 非 web_search 4xx,resp 已消费,用 captured 三元组
         log_upstream_error_diag(
             &telemetry,
-            status,
+            st,
             &upstream_url,
             &outbound_headers_snapshot,
             &plan.body,
-            &body_bytes,
+            &body,
         );
-        let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
-        Box::pin(single)
+        let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
+        (
+            st,
+            filter_hop_headers(&hs),
+            Box::pin(single) as codex_app_transfer_adapters::ByteStream,
+        )
+    } else {
+        // resp 仍活着(成功路径 / retry 后 / 5xx 路径)
+        let resp = live_resp.expect("live_resp is Some when captured_4xx is None");
+        let st = resp.status();
+        let hs = filter_hop_headers(resp.headers());
+        let stream: codex_app_transfer_adapters::ByteStream = if st.is_success() {
+            let raw = Box::pin(
+                resp.bytes_stream()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            );
+            Box::pin(TracedStream::new(
+                raw,
+                t_send,
+                st.as_u16(),
+                upstream_url.clone(),
+            ))
+        } else {
+            // retry 后再次 4xx 或 5xx
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            log_upstream_error_diag(
+                &telemetry,
+                st,
+                &upstream_url,
+                &outbound_headers_snapshot,
+                &plan.body,
+                &body_bytes,
+            );
+            let single =
+                futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
+            Box::pin(single)
+        };
+        (st, hs, stream)
     };
 
     let response_plan = adapter.transform_response_stream(
@@ -446,6 +516,91 @@ impl Drop for TracedStream {
 /// 辅助诊断身份头泄漏 / 反爬识别 / token 配置等问题。
 /// 截断到 ~2KB(req)+ 4KB(resp)避免污染日志;headers 全打但脱敏 Authorization /
 /// api-key 等敏感字段。
+/// 拼上游完整 URL(base 末尾去 `/`,upstream_path 必含 `/` 时直接拼,否则补)。
+fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
+    let path = if upstream_path.starts_with('/') {
+        upstream_path.to_string()
+    } else {
+        format!("/{}", upstream_path)
+    };
+    format!("{}{}", upstream_base.trim_end_matches('/'), path)
+}
+
+/// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
+/// **extras 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
+/// 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
+/// `User-Agent: codex-cli/...`)和 `provider.extraHeaders`(例如 kimi-code
+/// 的 `User-Agent: KimiCLI/1.40.0`)同名,两条值都会上线,部分上游严格按
+/// "首条 UA"判定接入身份就会绕过我们的伪装。这里在复制客户端 header 时,
+/// 先把 extras 已经覆盖的名字过滤掉,保证最终只有 extras 的值出去。
+///
+/// 抽成 helper 是为了 web_search transparent retry 路径复用同一份 header /
+/// auth 构造逻辑(forward 主路径调一次,4xx web_search 拒绝时再调一次)。
+async fn build_and_send_upstream(
+    state: &ProxyState,
+    method: &http::Method,
+    inbound_headers: &HeaderMap,
+    resolved: &ResolvedProvider,
+    plan_body: &Bytes,
+    upstream_url: &str,
+) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    let mut up = state
+        .http
+        .request(method.clone(), upstream_url)
+        .body(plan_body.clone());
+    for (name, value) in inbound_headers.iter() {
+        if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
+            continue;
+        }
+        if resolved.extra_headers.contains_key(name) {
+            continue;
+        }
+        up = up.header(name, value);
+    }
+    up = inject_auth(up, resolved);
+    for (name, value) in resolved.extra_headers.iter() {
+        up = up.header(name, value);
+    }
+    let req = up.build()?;
+    let outbound_headers_snapshot = req.headers().clone();
+    let resp = state.http.execute(req).await?;
+    Ok((resp, outbound_headers_snapshot))
+}
+
+/// 检测上游 4xx 响应 body 是否是"web search plugin / Web Search 能力未开"
+/// 这一类错误。命中时 `forward.rs` 主路径会调用
+/// `adapters::disable_web_search_for(provider_id)` 把当前 provider 加入本进程
+/// 内存 disable cache,避免后续 turn 重复触发同样错误。
+///
+/// **匹配关键字**(实测覆盖):
+/// - MiMo Token Plan / 其他套餐没开 Web Search Plugin:`"webSearchEnabled is false"`
+///   / `"web search tool found"`(实测 2026-05-09 dump)
+/// - 通用兜底:`"web_search"` + `"not enabled" / "not supported" / "not activated"`
+///   未来其他 provider 可能用类似措辞,留个宽松兜底
+///
+/// 误判风险:**故意宽松**(关键字 OR 命中即触发 disable),最坏情况是用户
+/// 没开 web_search_enabled 也"被 disable"(本来就是 disabled,无副作用)。
+fn is_web_search_upstream_reject(body_bytes: &[u8]) -> bool {
+    let body = match std::str::from_utf8(body_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let lower = body.to_ascii_lowercase();
+    // 实测精确字面量(MiMo)
+    if lower.contains("websearchenabled is false")
+        || lower.contains("web search tool found in the request body")
+    {
+        return true;
+    }
+    // 通用兜底
+    let mentions_web_search = lower.contains("web_search") || lower.contains("web search");
+    let mentions_not_available = lower.contains("not enabled")
+        || lower.contains("not supported")
+        || lower.contains("not activated")
+        || lower.contains("disabled");
+    mentions_web_search && mentions_not_available
+}
+
 fn log_upstream_error_diag(
     telemetry: &crate::telemetry::ProxyTelemetry,
     status: StatusCode,
@@ -861,5 +1016,51 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "deepseek-v4-pro[beta]");
         assert_eq!(v["stream"], true);
+    }
+
+    // ── is_web_search_upstream_reject 关键字识别(B 层 fallback 触发条件)──
+
+    #[test]
+    fn web_search_reject_matches_mimo_exact_literal() {
+        // MiMo Token Plan 套餐没开 Web Search Plugin 时实测错误体
+        // (2026-05-09 dump 抓到的精确字面量)
+        let body = br#"{"error":{"code":"400","message":"Param Incorrect","param":"web search tool found in the request body, but webSearchEnabled is false","type":""}}"#;
+        assert!(is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn web_search_reject_matches_camelcase_variant() {
+        let body = br#"{"error":"webSearchEnabled is false"}"#;
+        assert!(is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn web_search_reject_matches_generic_not_enabled_phrasing() {
+        // 兜底:其他 provider 可能用类似措辞
+        let body = br#"{"error":"web_search is not enabled for this account"}"#;
+        assert!(is_web_search_upstream_reject(body));
+        let body2 = br#"{"error":"web search not activated"}"#;
+        assert!(is_web_search_upstream_reject(body2));
+    }
+
+    #[test]
+    fn web_search_reject_does_not_match_unrelated_400() {
+        // 普通 400 错误不该误触发 fallback(只 disable web_search)
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"Invalid model name\"}"
+        ));
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"token limit exceeded\"}"
+        ));
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"rate limit reached\"}"
+        ));
+    }
+
+    #[test]
+    fn web_search_reject_handles_non_utf8_safely() {
+        // 上游返回非 UTF-8 时不 panic,认为不匹配
+        let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
+        assert!(!is_web_search_upstream_reject(body));
     }
 }
