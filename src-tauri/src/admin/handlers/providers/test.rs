@@ -291,10 +291,12 @@ async fn test_provider_connection(provider: &Value) -> Value {
     let status_code = response.status().as_u16();
     let mut reachable = status_code < 500;
     // 401/403 = endpoint 已响应 + 需鉴权(server 认得请求)= **baseUrl 连接性 OK**。
-    // 但鉴权失败也可能是 baseUrl 配错(指向需 auth 的非 LLM endpoint)/ key 过期 /
-    // key 给错 provider —— 直接显示"connection OK"绿色会误导。改成 reachable=true
-    // (UI 不标 bad 红色)+ authStatus="auth_required_or_invalid" 让前端标黄色警告 +
-    // 文案显式区分"已可达,但 server 拒绝鉴权,如确认 key 没错可能 baseUrl 不是 LLM API"。
+    // 但鉴权层语义跟连接层语义解耦,**测速绿色 + 文案明示鉴权未验证** 比黄色更准确:
+    // 黄色容易让用户误以为 baseUrl 错(2026-05-10 用户实测痛点 — proxy.mochance.xyz/v1
+    // 实际可达但显示橙色 "auth required or invalid" 看起来像配错)。改回绿色 + 文案
+    // "connection OK; API key not configured or auth not verified" 明示连接成功 +
+    // 鉴权状态 — 保留 authStatus 字段(信息完整,留给未来 UI 决策),但 frontend
+    // helper 不再依据它标黄。
     let auth_status = if matches!(status_code, 401 | 403) {
         "auth_required_or_invalid"
     } else {
@@ -303,9 +305,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
     let message = if (200..300).contains(&status_code) {
         format!("connection OK, {latency_ms} ms")
     } else if matches!(status_code, 401 | 403) {
-        format!(
-            "reachable, HTTP {status_code} (auth required or invalid — verify API key matches this baseUrl). {latency_ms} ms"
-        )
+        format!("connection OK; API key not configured or auth not verified, {latency_ms} ms")
     } else if matches!(status_code, 404 | 405) {
         reachable = false;
         format!("endpoint unavailable, HTTP {status_code}. Verify the base URL points to a Codex-compatible endpoint. ({latency_ms} ms)")
@@ -507,17 +507,20 @@ mod tests {
             server.abort();
 
             assert_eq!(result["success"], json!(true));
-            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK(reachable=true,
-            // UI 不标 bad);但 authStatus="auth_required_or_invalid" 让前端标黄色
-            // 警告 + 文案区分,避免用户把"key 错 / baseUrl 不是 LLM endpoint"误判
-            // 为 baseUrl 完全 OK
+            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK,绿色显示
+            // (2026-05-10 反转:之前文案 "auth required or invalid" 标黄误导
+            //  用户以为 baseUrl 错;改回绿色 + 文案明示连接成功+鉴权未验证)
             assert_eq!(result["ok"], json!(true));
             assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(401));
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("auth required or invalid"));
+                .contains("connection OK"));
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("API key not configured or auth not verified"));
         });
     }
 
@@ -561,12 +564,16 @@ mod tests {
             assert_eq!(result["ok"], json!(true), "403 仍 reachable");
             assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(403));
-            // H3 (silent-failure-hunter review):防文案回归 — 403 message 必须含
-            // "auth required or invalid" 子串(跟 401 共用 match arm 的回归保险)
+            // 防文案回归 — 403 跟 401 共用 match arm,message 必须含
+            // "connection OK" + "API key not configured or auth not verified"
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("auth required or invalid"));
+                .contains("connection OK"));
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("API key not configured or auth not verified"));
         });
     }
 
