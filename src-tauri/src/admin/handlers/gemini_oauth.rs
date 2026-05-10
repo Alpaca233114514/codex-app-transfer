@@ -106,6 +106,53 @@ pub fn cancel_in_flight_login() -> bool {
     false
 }
 
+/// 进程级共享的 reqwest::Client,专门给 OAuth login flow + Cloud Code Assist
+/// bootstrap 用 —— **不**重复创建,跨多次 login / refresh 复用底层 TLS 连接池
+/// + DNS resolver 缓存。原 login_handler 每次新建 Client 会让 reqwest 走新的
+/// connector setup(rustls config / DNS / IPv6 fallback timing),login 5min
+/// 内连续触发(eg user 取消重试)产生 N 个独立 connection pool 浪费 ~MB RAM
+/// + 多次 Google IP 探测 = 灰色 IP rep。
+///
+/// **Why OnceLock**:无 lazy_static 依赖、零运行时开销、`static` 安全跨线程,
+/// 第一次调用初始化。
+///
+/// **Init 失败处理**(chatgpt-codex P1 修):builder 失败时返 Err 让 caller 走
+/// 500 错误响应。**不**用 `Client::new()` fallback —— `Client::new()` 内部也是
+/// `Client::builder().build().unwrap()`,builder 失败的环境(TLS/resolver 初
+/// 始化失败)`Client::new()` 100% 也 panic,把 recoverable 500 转成 runtime
+/// crash。OnceLock 存 Result 让首次失败被记忆,后续调用也直接返 Err 不重试
+/// (避免每次 login 都打一遍 panic-prone path)。
+///
+/// **Pool 配置**:`pool_idle_timeout(30s)` 跟原 login_handler 一致,避免 long-
+/// idle 后端 keep-alive 超时被中断。
+///
+/// **Why 不复用 ProxyState.http**:ProxyState 是 chat 路径专用,有自己 timeout
+/// + redirect policy。OAuth flow 想要 stricter behavior,独立 pool 边界清晰。
+pub fn shared_oauth_http_client() -> Result<&'static reqwest::Client, &'static str> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    let cell = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                tracing::error!(
+                    error_id = "OAUTH_HTTP_CLIENT_BUILDER_FAILED",
+                    error = %e,
+                    "reqwest::Client::builder failed for OAuth shared client; \
+                     login_handler 将返 500 — verify system TLS / resource state"
+                );
+                format!("reqwest::Client::builder failed: {e}")
+            })
+    });
+    match cell {
+        Ok(c) => Ok(c),
+        // 静态字面值 — caller 用 .into_response() 时不需要持有 owned String
+        Err(_) => Err(
+            "OAuth HTTP client init failed (TLS/resolver issue); check OAUTH_HTTP_CLIENT_BUILDER_FAILED log",
+        ),
+    }
+}
+
 pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/gemini-oauth/status", get(status_handler))
@@ -177,20 +224,13 @@ async fn status_handler() -> impl IntoResponse {
 /// Request body:`{}`(无参数)
 /// Response:成功返 200 + 当前 status 形态;失败返 4xx/5xx + error message
 async fn login_handler() -> impl IntoResponse {
-    // 用 ProxyState 那个 reqwest::Client 浪费(它是给 forward 用的);新建一个
-    // 共享 long-living client 给 OAuth + Cloud Code 调用,启用 rustls-tls。
-    let http = match reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
+    // 拿进程级共享 client(M1 修):跨多次 login / refresh 复用 connection
+    // pool + DNS cache + TLS session,避免每次 login 重建 connector(rustls
+    // config + Google IP 探测 ~ 50-200ms 浪费)。底层 ProxyState client 跟
+    // 这个独立,chat path 行为不变(forward.rs 仍走 ProxyState.http)
+    let http = match shared_oauth_http_client() {
         Ok(c) => c,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reqwest client build: {e}"),
-            )
-            .into_response();
-        }
+        Err(msg) => return err(StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     };
 
     // 1. 跑 OAuth flow:loopback server + browser open + 等 callback + token exchange
@@ -570,6 +610,22 @@ mod tests {
     fn routes_compile_and_paths_are_unique() {
         // smoke test:确保 routes() 编译且不 panic
         let _ = routes();
+    }
+
+    /// **M1 修核心 contract**:shared_oauth_http_client() 多次调用必须返同一
+    /// instance(进程级 OnceLock pooling),不是每次新建。底层 connection
+    /// pool / DNS cache / TLS session 才能跨 login 复用。
+    #[test]
+    fn shared_oauth_http_client_returns_same_instance_across_calls() {
+        let c1 = shared_oauth_http_client().expect("init OK on test env");
+        let c2 = shared_oauth_http_client().expect("init OK on test env");
+        let c3 = shared_oauth_http_client().expect("init OK on test env");
+        // 比指针地址 — Client 没实现 PartialEq,但 OnceLock 同一 init 必返同
+        // 一引用,&'static 引用比较即指针等价
+        assert!(
+            std::ptr::eq(c1, c2) && std::ptr::eq(c2, c3),
+            "shared_oauth_http_client 必须每次返同一 OnceLock 实例,实测不同 → 没复用 connection pool"
+        );
     }
 
     /// 写一个特定 providers 数组到 disk(测试 fixture)
