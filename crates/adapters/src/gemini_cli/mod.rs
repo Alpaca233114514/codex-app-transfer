@@ -40,6 +40,16 @@ use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan}
 pub mod request;
 pub mod response;
 
+/// `apiFormat` 值是否属于 antigravity OAuth provider(全部别名,大小写无关)。
+/// 必须跟 `crates/proxy/src/resolver.rs::AuthScheme::parse` 与
+/// `crates/adapters/src/registry.rs` 接受的别名集合一致。
+fn is_antigravity_api_format(api_format: &str) -> bool {
+    matches!(
+        api_format.to_ascii_lowercase().as_str(),
+        "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+    )
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GeminiCliAdapter;
 
@@ -72,30 +82,39 @@ impl Adapter for GeminiCliAdapter {
             .to_owned();
         // project_id 三层 fallback:
         //   1. provider.extra.cloud_code_project_id(admin handler login 时 sync 写)
-        //   2. ~/.codex-app-transfer/gemini-oauth.json(login bootstrap 时 persist,
+        //   2. ~/.codex-app-transfer/<token-file>.json(login bootstrap 时 persist,
         //      authoritative source — 避免 sync_to_active_provider 失败 / race)
         //   3. 都缺 → BadRequest 提示用户重 login
-        // 修历史:仅依赖 (1) 时,sync 失败(如 active 切到非 OAuth 后切回的 race)
-        // 让 chat 全 fail "cloud_code_project_id required",但磁盘 token 实际有
-        // project_id,user 已成功 login。2026-05-11 实测触发。
+        //
+        // **文件名按 apiFormat 选**:gemini-cli (`gemini_cli_oauth`) 用
+        // `gemini-oauth.json`,antigravity (`antigravity_oauth` / `antigravity` /
+        // `google_oauth_antigravity`) 用 `antigravity-oauth.json`。两个 provider
+        // token 文件独立,project_id 也独立(各自 bootstrap 拿不同的 GCP project)。
+        // 别名集合必须跟 `crates/proxy/src/resolver.rs` AuthScheme parse 与
+        // `crates/adapters/src/registry.rs` adapter dispatch 一致 —— 否则用户
+        // 手填别名 silently 读错文件污染对方 token(2026-05-11 review 修)
+        let token_filename = if is_antigravity_api_format(&provider.api_format) {
+            "antigravity-oauth.json"
+        } else {
+            "gemini-oauth.json"
+        };
         let project_id = provider
             .extra
             .get("cloud_code_project_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .or_else(|| {
-                codex_app_transfer_gemini_oauth::TokenStore::from_home_env()
+                codex_app_transfer_gemini_oauth::TokenStore::for_token_filename(token_filename)
                     .ok()
                     .and_then(|store| store.load().ok().flatten())
                     .and_then(|token| token.project_id)
             })
             .ok_or_else(|| {
-                AdapterError::BadRequest(
+                AdapterError::BadRequest(format!(
                     "cloud_code_project_id missing in both provider.extra and \
-                     ~/.codex-app-transfer/gemini-oauth.json — run OAuth login \
+                     ~/.codex-app-transfer/{token_filename} — run OAuth login \
                      to bootstrap project"
-                        .into(),
-                )
+                ))
             })?;
 
         // 1. 复用 gemini_native 把 Codex /responses 转 Gemini inner body
@@ -103,20 +122,92 @@ impl Adapter for GeminiCliAdapter {
             crate::gemini_native::request::responses_body_to_gemini_request(&parsed, provider)?;
         let mut inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
 
-        // **cloud-code wire 兼容性**:`tool_config.includeServerSideToolInvocations`
-        // 仅在 generativelanguage(API key)/ Vertex 路径 proto 已实装;
-        // cloudcode-pa OAuth 路径 proto 当前**不识别**此字段,返
-        // `400 INVALID_ARGUMENT: Unknown name "includeServerSideToolInvocations"`
-        // (实测 2026-05-11 Gemini 3 + Codex tools 触发)。CLIProxyAPI / gemini-cli
-        // upstream 在 cloudcode-pa 路径**都不发**此字段 — combined `tools: [
-        // {googleSearch:{}}, {functionDeclarations:[...]}]` 在 cloudcode-pa
-        // Gemini 3 模型上原生接受,不需要 flag。strip 后继续走。
+        // **cloud-code wire 兼容性 — 按 provider 分流**:
+        // - **gemini-cli OAuth**(cloudcode-pa via gemini-cli client_id):
+        //   cloudcode-pa OAuth 路径 proto **不识别** `includeServerSideToolInvocations`
+        //   返 400 `Unknown name`。CLIProxyAPI / gemini-cli upstream 都不发此字段
+        //   → strip
+        // - **antigravity OAuth**(cloudcode-pa via antigravity client_id):
+        //   反向 — 上游**要求**这个 flag = true 才能 combined tools(built-in +
+        //   function declarations),缺失返 400 `Please enable
+        //   tool_config.include_server_side_tool_invocations to use Built-in tools
+        //   with Function calling`(2026-05-11 实测)。**强制 set true**,
+        //   不依赖上游 responses_body_to_gemini_request 是否注入
+        // 不同 client_id 走不同 proto 分支 — Google 内部行为差异
+        let is_antigravity = is_antigravity_api_format(&provider.api_format);
         if let Some(obj) = inner_value.as_object_mut() {
+            // **toolConfig.includeServerSideToolInvocations 字段在 cloudcode-pa
+            // 任何 OAuth 路径(gemini-cli 或 antigravity)都不识别**(实测 2026-05-11
+            // 两条 client_id 路径都 400 "Unknown name ... Cannot find field"),
+            // 不管 camelCase / snake_case。先无条件 strip 两种形态。
+            // Google "Please enable" 提示是误导 — 该 flag 在公开 proto 不存在
             if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
                 tc.remove("includeServerSideToolInvocations");
-                // 如果 toolConfig 整体空(只有这一个 flag),把 toolConfig 整个移除
+                tc.remove("include_server_side_tool_invocations");
                 if tc.is_empty() {
                     obj.remove("toolConfig");
+                }
+            }
+
+            // **antigravity 路径拒 built-in tools + functionDeclarations 共存**
+            // (实测 2026-05-11 daily-cloudcode-pa 返 400 "Built-in tools with
+            // Function calling")。flag 又不能 enable。**只能 strip 内置 tools**
+            // (googleSearch / urlContext / codeExecution),保留 function_declarations
+            // (Codex.app 主用)。对应 gemini_native 的 Gemini 2.x fallback 路径,
+            // 但 antigravity 把所有 Gemini 3 model 当 2.x 那么处理
+            if is_antigravity {
+                if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                    let mut has_function_decls = false;
+                    for t in tools.iter() {
+                        if t.as_object()
+                            .map(|o| {
+                                o.contains_key("functionDeclarations")
+                                    || o.contains_key("function_declarations")
+                            })
+                            .unwrap_or(false)
+                        {
+                            has_function_decls = true;
+                            break;
+                        }
+                    }
+                    if has_function_decls {
+                        // **silent strip**(2026-05-11 user 反馈 Bug N revert):
+                        // gemini-3.x 模型自带"无 google_search 时改用 exec_command/curl"
+                        // 的 fallback 推理能力,加 system_instruction 软约束反而让
+                        // 模型保守拒绝网络任务。silent drop 让模型按自身能力自适应,
+                        // 实测效果更好。Gemini 2.x 路径仍由 gemini_native 内部加
+                        // soft constraint(2.x 推理弱需要明确提示)
+                        let before = tools.len();
+                        tools.retain(|t| {
+                            t.as_object()
+                                .map(|o| {
+                                    !o.contains_key("googleSearch")
+                                        && !o.contains_key("google_search")
+                                        && !o.contains_key("urlContext")
+                                        && !o.contains_key("url_context")
+                                        && !o.contains_key("codeExecution")
+                                        && !o.contains_key("code_execution")
+                                        && !o.contains_key("googleSearchRetrieval")
+                                        && !o.contains_key("google_search_retrieval")
+                                })
+                                .unwrap_or(true)
+                        });
+                        let stripped = before - tools.len();
+                        if stripped > 0 {
+                            // **telemetry anchor**(silent-failure-hunter C1 修):
+                            // 没此 log,user 投诉"模型说不能联网但实际可以"时无线索
+                            // 定位到此 strip 路径。info 级别(不报错,只标记策略生效)
+                            tracing::info!(
+                                error_id = "GEMINI_CLI_BUILTIN_TOOLS_STRIPPED",
+                                stripped_count = stripped,
+                                tool_keys = ?["googleSearch", "urlContext", "codeExecution", "googleSearchRetrieval"],
+                                "antigravity wire 不接受 built-in tools + functionDeclarations 共存,strip 内置工具(模型走 exec_command/curl 自适应)"
+                            );
+                        }
+                        if tools.is_empty() {
+                            obj.remove("tools");
+                        }
+                    }
                 }
             }
         }
@@ -128,6 +219,22 @@ impl Adapter for GeminiCliAdapter {
             request::wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
                 AdapterError::BadRequest(format!("OS RNG unavailable for user_prompt_id: {e}"))
             })?;
+
+        // 3. **antigravity 专属 body 后处理**:加 4 个 antigravity 必需字段
+        // (userAgent / requestType / requestId / request.sessionId)+ delete
+        // request.safetySettings + 顶层 toolConfig 搬到 request 子对象。
+        // 不做这层 antigravity 上游识别成 non-canonical client → 配额错 bucket
+        // / 429。CLIProxyAPI `geminiToAntigravity` 1:1 实证(2026-05-11 修)。
+        // gemini-cli 不需要这层(共用 wire 但 body shape 不同)
+        let outer = if is_antigravity_api_format(&provider.api_format) {
+            request::apply_antigravity_transform(outer, &model).map_err(|e| {
+                AdapterError::BadRequest(format!(
+                    "OS RNG unavailable for antigravity requestId: {e}"
+                ))
+            })?
+        } else {
+            outer
+        };
         let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
 
         // 3. cloud-code 上游 path: 不像 gemini_native 是 /v1{alpha,beta}/models/<m>:method
@@ -224,6 +331,45 @@ mod adapter_tests {
     #[test]
     fn name_is_stable_id() {
         assert_eq!(GeminiCliAdapter.name(), "gemini_cli_oauth");
+    }
+
+    /// 锚定 antigravity api_format 别名集合 — 必须跟 `crates/proxy/src/resolver.rs`
+    /// `AuthScheme::parse` 与 `crates/adapters/src/registry.rs` adapter dispatch
+    /// 一致。任一别名漏判会让用户手填的 provider config silently 读错 token 文件
+    /// (gemini-oauth.json vs antigravity-oauth.json),刷新时会用错 client_id
+    /// 污染对方 token —— 两个 provider 同时 brick(2026-05-11 review #1 修)
+    #[test]
+    fn is_antigravity_api_format_recognizes_all_aliases() {
+        // 全部 antigravity 别名(大小写无关)
+        for v in [
+            "antigravity_oauth",
+            "antigravity",
+            "google_oauth_antigravity",
+            "Antigravity-OAuth", // dash 不识别(parse 在 registry/resolver 层做)
+            "ANTIGRAVITY",
+            "Antigravity",
+        ] {
+            // dash 形式不接受 —— 这里 lowercase 后是 "antigravity-oauth" 不在白名单
+            // 这是有意:adapter 层只接受 underscore + 全 alias,跟 registry lookup
+            // 入口的 normalize 行为对齐(registry.lookup 也 fail dash)
+            let normalized = v.to_ascii_lowercase();
+            let expected = matches!(
+                normalized.as_str(),
+                "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+            );
+            assert_eq!(is_antigravity_api_format(v), expected, "alias {v} 识别错");
+        }
+        // 非 antigravity 必须返 false
+        for v in [
+            "gemini_cli_oauth",
+            "gemini_cli",
+            "google_oauth_cloud_code",
+            "openai_chat",
+            "",
+            "antigravity_other",
+        ] {
+            assert!(!is_antigravity_api_format(v), "{v} 不应判成 antigravity");
+        }
     }
 
     /// **cloud-code wire 兼容性**:Gemini 3 + Codex tools 触发 transformer 加
