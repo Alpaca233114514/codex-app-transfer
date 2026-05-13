@@ -55,8 +55,10 @@ macos/assets/app-icon.iconset/
 macos/assets/app-icon-prepared.png
 
 # Internal-only docs (kept locally; not part of the public repo)
+docs/grok/
 docs/litellm/
 docs/plan/
+反馈/
 
 # Feedback Worker secrets / 本地缓存
 feedback-worker/.env

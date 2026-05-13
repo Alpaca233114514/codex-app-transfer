@@ -44,6 +44,7 @@
     aliyun: { logo: 'assets/providers/aliyun.ico' },
     minimax: { logo: 'assets/providers/minimax.ico' },
     minimaxi: { logo: 'assets/providers/minimax.ico' },
+    anyrouter: { icon: 'bi-diagram-3-fill' },
     // Gemini CLI(OAuth)provider — 用 Gemini 品牌四角星 spark 图标(brand mark
     // 跟 gemini.google.com 一致)。**必须放在 'gemini' 通用规则前**(JS object
     // iteration 顺序 = insertion 顺序),computeIcon 子串匹配 'gemini-cli' 命中
@@ -145,11 +146,12 @@
       // **修复历史(2026-05-10)**:旧实现把白名单外任何 apiFormat(包括新加的
       // `gemini_native`)强制改写成 `'openai_chat'` → backend 收到 openai_chat
       // 走 /chat/completions 探测 → Gemini native 端点不存在 → 404(用户截图反馈)。
-      // 改成 passthrough 已知协议(responses/openai_chat/gemini_native + 别名),
-      // 让后端 normalize_provider_api_format 唯一负责协议规范化(它已识别全部 3 种)。
+      // 改成 passthrough 已知协议(responses/openai_chat/gemini_native/anthropic_messages
+      // + 别名),让后端 normalize_provider_api_format 唯一负责协议规范化。
       apiFormat: (() => {
         const v = (payload.apiFormat || '').toLowerCase().replace(/-/g, '_');
-        if (['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(v)) return 'responses';
+        if (['responses', 'openai_responses'].includes(v)) return 'responses';
+        if (['anthropic_messages', 'anthropic', 'claude', 'messages', 'claude_messages'].includes(v)) return 'anthropic_messages';
         if (['gemini_native', 'google_ai_studio', 'gemini'].includes(v)) return 'gemini_native';
         // Cloud Code Assist OAuth(impersonate gemini-cli)— passthrough,
         // 后端 normalize_provider_api_format 识别 + GeminiCliAdapter 路由。
@@ -234,7 +236,7 @@
         // 把任何不在白名单的 apiFormat(包括新加的 `gemini_native`)强制改写成
         // 字面量 `'OpenAI'`,导致 normalizeApiFormat 永远命中 default openai_chat
         // 分支,UI 显示协议名错误。passthrough + 让 normalizeApiFormat 处理是
-        // 唯一正确做法(它已识别 openai_chat / responses / anthropic / gemini_native
+        // 唯一正确做法(它已识别 openai_chat / responses / anthropic_messages / gemini_native
         // 各种子值,加新协议只需更新 normalizeApiFormat,不需要改这里)。
         apiFormat: p.apiFormat || 'openai_chat',
         authScheme: p.authScheme || 'bearer',
@@ -243,6 +245,7 @@
         baseUrlOptions: p.baseUrlOptions || [],
         baseUrlHint: p.baseUrlHint || '',
         requestOptionPresets: p.requestOptionPresets || {},
+        notices: p.notices || [],
         extraHeaders: p.extraHeaders || {},
         modelCapabilities: p.modelCapabilities || {},
         requestOptions: p.requestOptions || {},

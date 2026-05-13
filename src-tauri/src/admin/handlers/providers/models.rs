@@ -90,6 +90,12 @@ fn model_endpoint_candidates(provider: &Value) -> Vec<String> {
         // **不要**push 别的 candidates(如 `{base_url}/models` 或 v1/models),
         // Google 上游对 unknown path 返 404 — 多 fallback 浪费请求 + 日志噪音。
         candidates.push(upstream.clone());
+    } else if api_format == "anthropic_messages" {
+        candidates.push(replace_path_suffix(
+            &upstream,
+            &["/v1/messages", "/messages"],
+            "/v1/models",
+        ));
     } else if api_format == "openai_chat" {
         candidates.push(replace_path_suffix(
             &upstream,
@@ -573,6 +579,97 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_endpoint_candidates_anthropic_messages_use_models_endpoint() {
+        assert_eq!(
+            model_endpoint_candidates(&json!({
+                "baseUrl": "https://api.anthropic.com/v1",
+                "apiFormat": "anthropic_messages",
+            })),
+            vec!["https://api.anthropic.com/v1/models".to_owned()]
+        );
+        assert_eq!(
+            model_endpoint_candidates(&json!({
+                "baseUrl": "https://proxy.example/anthropic",
+                "apiFormat": "claude",
+            })),
+            vec!["https://proxy.example/anthropic/v1/models".to_owned()]
+        );
+        assert_eq!(
+            model_endpoint_candidates(&json!({
+                "baseUrl": "https://proxy.example/anthropic/v1/messages",
+                "apiFormat": "messages",
+            })),
+            vec!["https://proxy.example/anthropic/v1/models".to_owned()]
+        );
+    }
+
+    #[test]
+    fn fetch_provider_models_reads_anthropic_messages_models_with_version_header() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{
+                http::{HeaderMap as AxumHeaderMap, StatusCode as AxumStatusCode},
+                routing::get,
+                Router,
+            };
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/models",
+                get(|headers: AxumHeaderMap| async move {
+                    if headers
+                        .get("anthropic-version")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("2023-06-01")
+                    {
+                        (
+                            AxumStatusCode::OK,
+                            Json(json!({
+                                "data": [
+                                    {"id": "claude-sonnet-4-6"},
+                                    {"id": "claude-opus-4-6"}
+                                ]
+                            })),
+                        )
+                    } else {
+                        (
+                            AxumStatusCode::BAD_REQUEST,
+                            Json(json!({"error": "missing anthropic-version"})),
+                        )
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let provider = json!({
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "anthropic_messages",
+                "authScheme": "none"
+            });
+            let result = fetch_provider_models_impl(&provider).await;
+            server.abort();
+
+            assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(
+                result.get("endpoint").and_then(|v| v.as_str()),
+                Some(format!("http://{addr}/v1/models").as_str())
+            );
+            assert_eq!(
+                result.get("models").and_then(|v| v.as_array()).cloned(),
+                Some(vec![json!("claude-sonnet-4-6"), json!("claude-opus-4-6")])
+            );
+        });
+    }
 
     #[test]
     fn fetch_provider_models_reads_openai_compatible_models() {

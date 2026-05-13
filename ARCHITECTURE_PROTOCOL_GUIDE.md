@@ -1,7 +1,7 @@
 # 架构设计与协议添加规则
 
 > 适用范围：`crates/adapters` 及与协议转换相关的转发路径。  
-> 当前状态：基于 Phase 4 Final 实际代码结构整理。
+> 当前状态：基于 Phase 5 Anthropic Messages PR 实际代码结构整理。
 
 ## 1. 当前架构设计（落地版）
 
@@ -15,11 +15,15 @@
   - `chat`：Responses <-> Chat 侧映射
   - `gemini_native`：Gemini native 请求/响应映射
   - `cloud_code`：Gemini CLI / Antigravity flavor 映射
+  - `grok_web`：Grok Web 请求 flatten、父响应追踪与 SSE 回写映射
+  - `anthropic_messages`：Responses <-> Anthropic Messages 请求/响应映射
   - `mapper/mod.rs`：`RequestMapper` / `ResponseMapper` trait + 契约测试
 - `adapter`（薄编排）：
   - `responses/mod.rs`
   - `gemini_native/mod.rs`
   - `gemini_cli/mod.rs`
+  - `grok_web/mod.rs`
+  - `anthropic_messages/mod.rs`
   - 仅负责调用 mapper/core，不承载复杂 provider-specific 分支
 - `openai_chat.rs` / `passthrough.rs`
   - 当前保持直接 `Adapter` 实现（透传路径），不强制纳入 mapper
@@ -75,9 +79,23 @@
 ### 3.4 文档与变更同步规则
 
 - 实现完成后必须同步：
-  - `docs/protocol-unification-rfc-phase4.md`（或后续 RFC）
+  - `docs/protocol-unification-rfc-phase4.md`（或后续 RFC，例如 Phase 5）
   - 变更清单（涉及文件、测试结果、已知风险）
 - 保持“代码结构说明”与“实际目录结构”一致，避免文档漂移
+
+### 3.5 已落地 canonical protocol
+
+当前 registry 中应保持下列 canonical protocol 字面值稳定：
+
+- `openai_chat`：OpenAI Chat-compatible 上游，默认 fallback。
+- `responses`：OpenAI Responses 语义；custom direct mode 只允许 `responses` / `openai_responses` 旁路本地代理。
+- `gemini_native`：Google AI Studio `generateContent` / `streamGenerateContent`。
+- `gemini_cli_oauth`：Google Cloud Code Assist OAuth wire。
+- `antigravity_oauth`：Antigravity OAuth flavor，复用 Cloud Code Assist wire。
+- `grok_web`：grok.com Web 后端反代 wire。
+- `anthropic_messages`：Anthropic `/v1/messages` wire，历史别名 `anthropic` / `claude` / `messages` / `claude_messages` 必须归一或路由到该协议。
+
+新增协议时应优先新增明确 canonical 名称，避免把通用路径名（如 `messages`）作为 canonical，造成与本地兼容 route 混淆。
 
 ## 4. 验证与准入门槛
 
@@ -87,6 +105,12 @@
 - `cargo test -p codex-app-transfer-adapters`
 - 必要时：`cargo check --workspace`
 - 新增协议需有对应 mapper/adapter 回归测试，不得只改实现不补测试
+- 如果新增协议同时暴露到 provider UI，还需覆盖：
+  - provider `apiFormat` 归一化；
+  - provider connection test URL/body/header；
+  - model list endpoint 推导；
+  - direct-mode bypass guard；
+  - 前端保存 canonical 值和旧配置别名显示。
 
 ## 5. 例外处理机制
 

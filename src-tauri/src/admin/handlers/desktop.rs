@@ -287,8 +287,9 @@ fn desktop_config_target_for_provider(
     //
     // 适用范围:OpenAI 官方 / 任何原生实现 OpenAI Responses API 的反代或自建服务。
     // 触发条件:
-    //   - apiFormat 严格等于 `responses` / `openai_responses`(anthropic / claude /
-    //     messages 是 Python 历史兼容值 → 继续走代理 ResponsesAdapter 本地转换)
+    //   - apiFormat 严格等于 `responses` / `openai_responses`(anthropic /
+    //     anthropic_messages / claude / messages 是 Anthropic Messages 路径
+    //     → 继续走代理做本地协议转换)
     //   - baseUrl 与 apiKey 都非空(空了 direct 没法 work,fallback 到 local_proxy)
     //   - healing 命中 builtin preset 时强制覆盖 apiFormat=openai_chat,**builtin
     //     用户行为不变**(MiMo / Kimi / DeepSeek / MiniMax / 智谱 / 百炼 / Kimi Code 等)
@@ -1014,10 +1015,17 @@ mod tests {
     #[test]
     fn anthropic_aliases_never_bypass_proxy() {
         // 防回归:`anthropic` / `claude` / `messages` 是 Python 历史兼容值,
-        // 必须继续走 local_proxy ResponsesAdapter 本地协议转换;direct 分支只放行
-        // `responses` / `openai_responses`。如未来误把 anthropic 加进 bypass match
+        // canonical `anthropic_messages` 也必须继续走 local_proxy 做本地协议转换;
+        // direct 分支只放行 `responses` / `openai_responses`。如未来误把
+        // anthropic 加进 bypass match
         // → 复活 v1.x MiMo 404 类回归(Codex.app 直连第三方上游 /responses → 必 404)。
-        for fmt in ["anthropic", "claude", "messages"] {
+        for fmt in [
+            "anthropic",
+            "anthropic_messages",
+            "claude",
+            "messages",
+            "claude_messages",
+        ] {
             let mut cfg = config_with_secret();
             let provider = json!({
                 "id": "anthropic-aliased",

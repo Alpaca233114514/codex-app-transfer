@@ -98,6 +98,108 @@ fn chat_sse_capture_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
     }))
 }
 
+fn anthropic_sse_capture_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().fallback(any(move |req: Request| {
+        let calls = calls.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default();
+            let mut headers_map = serde_json::Map::new();
+            let mut headers_all: serde_json::Map<String, serde_json::Value> =
+                serde_json::Map::new();
+            for (k, v) in parts.headers.iter() {
+                let name = k.as_str().to_owned();
+                let value = v.to_str().unwrap_or("").to_owned();
+                headers_map.insert(name.clone(), serde_json::Value::String(value.clone()));
+                headers_all
+                    .entry(name)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::Value::String(value));
+            }
+            calls.lock().unwrap().push(json!({
+                "method": parts.method.as_str(),
+                "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                "headers": headers_map,
+                "headers_all": headers_all,
+                "body": String::from_utf8_lossy(&bytes),
+            }));
+            let payload = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(payload))
+                .unwrap()
+        }
+    }))
+}
+
+fn anthropic_invalid_thinking_retry_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().fallback(any(move |req: Request| {
+        let calls = calls.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default();
+            let mut guard = calls.lock().unwrap();
+            guard.push(json!({
+                "method": parts.method.as_str(),
+                "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                "body": String::from_utf8_lossy(&bytes),
+            }));
+            let attempt = guard.len();
+            drop(guard);
+
+            if attempt == 1 {
+                return Response::builder()
+                    .status(400)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            let payload = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_retry\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(payload))
+                .unwrap()
+        }
+    }))
+}
+
 async fn spawn(router: Router) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -213,6 +315,306 @@ async fn successful_forward_updates_proxy_telemetry() {
     assert!(logs
         .iter()
         .any(|entry| entry.level == "SUCCESS" && entry.message == "upstream status 200"));
+}
+
+#[tokio::test]
+async fn anthropic_messages_forward_injects_adapter_protocol_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-claude",
+        "bearer",
+        &[],
+    );
+    claude.api_format = "anthropic".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("anthropic-version", "stale-client-value")
+        .header("content-type", "text/plain")
+        .body(
+            json!({
+                "model": "claude-provider/claude-3-5-sonnet-latest",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":"hi"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call["path"], "/v1/messages");
+    assert_eq!(call["headers"]["anthropic-version"], "2023-06-01");
+    assert_eq!(call["headers"]["accept"], "application/json");
+    assert_eq!(call["headers"]["content-type"], "application/json");
+    assert_eq!(
+        call["headers_all"]["anthropic-version"]
+            .as_array()
+            .expect("anthropic-version header list")
+            .len(),
+        1
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(call["body"].as_str().expect("captured body")).unwrap();
+    assert_eq!(body["model"], "claude-3-5-sonnet-latest");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
+async fn anthropic_messages_forward_merges_provider_and_adapter_beta_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-claude",
+        "bearer",
+        &[("anthropic-beta", "provider-static-beta")],
+    );
+    claude.api_format = "anthropic_messages".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .body(
+            json!({
+                "model": "claude-provider/claude-opus-4-7",
+                "stream": true,
+                "input": "hi",
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {"type": "object"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    let beta = call["headers"]["anthropic-beta"].as_str().unwrap();
+    assert!(beta.contains("provider-static-beta"));
+    assert!(beta.contains("structured-outputs-2025-11-13"));
+    assert_eq!(
+        call["headers_all"]["anthropic-beta"]
+            .as_array()
+            .expect("anthropic-beta header list")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_oauth_key_uses_authorization_and_oauth_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-ant-oat-test-token",
+        "x-api-key",
+        &[("anthropic-beta", "provider-static-beta")],
+    );
+    claude.api_format = "anthropic_messages".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .body(
+            json!({
+                "model": "claude-provider/claude-opus-4-7",
+                "stream": true,
+                "input": "hi"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    assert_eq!(
+        call["headers"]["authorization"],
+        "Bearer sk-ant-oat-test-token"
+    );
+    assert!(
+        call["headers"].get("x-api-key").is_none(),
+        "OAuth token must not also be sent as x-api-key"
+    );
+    assert_eq!(
+        call["headers"]["anthropic-dangerous-direct-browser-access"],
+        "true"
+    );
+    let beta = call["headers"]["anthropic-beta"].as_str().unwrap();
+    assert!(beta.contains("provider-static-beta"));
+    assert!(beta.contains("oauth-2025-04-20"));
+    assert_eq!(
+        call["headers_all"]["anthropic-beta"]
+            .as_array()
+            .expect("anthropic-beta header list")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_non_oauth_bearer_does_not_add_oauth_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut anyrouter = provider(
+        "anyrouter",
+        &format!("http://{upstream}/v1"),
+        "anyrouter-test-key",
+        "bearer",
+        &[],
+    );
+    anyrouter.api_format = "anthropic_messages".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![anyrouter],
+        Some("anyrouter".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .body(
+            json!({
+                "model": "anyrouter/claude-opus-4-7",
+                "stream": true,
+                "input": "hi"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    assert_eq!(
+        call["headers"]["authorization"],
+        "Bearer anyrouter-test-key"
+    );
+    assert!(
+        call["headers"]
+            .get("anthropic-dangerous-direct-browser-access")
+            .is_none(),
+        "Anyrouter-style bearer keys must not be treated as Anthropic OAuth tokens"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_retries_once_after_invalid_thinking_signature() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_invalid_thinking_retry_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-claude",
+        "bearer",
+        &[],
+    );
+    claude.api_format = "anthropic_messages".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .body(
+            json!({
+                "model": "claude-provider/claude-opus-4-7",
+                "stream": true,
+                "input": [
+                    {"type": "message", "role": "user", "content": "hi"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "stale", "signature": "bad"},
+                            {"type": "text", "text": "visible"}
+                        ]
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "redacted_thinking", "data": "sealed"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let first: serde_json::Value =
+        serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(first["messages"][1]["content"][0]["type"], "thinking");
+    let retry: serde_json::Value =
+        serde_json::from_str(calls[1]["body"].as_str().unwrap()).unwrap();
+    assert!(retry.get("thinking").is_none());
+    let retry_messages = retry["messages"].as_array().unwrap();
+    assert_eq!(
+        retry_messages.len(),
+        2,
+        "assistant message containing only thinking must be omitted on retry"
+    );
+    assert_eq!(
+        retry_messages[1]["content"],
+        json!([{"type": "text", "text": "visible"}])
+    );
 }
 
 #[tokio::test]

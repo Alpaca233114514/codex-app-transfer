@@ -90,31 +90,91 @@ pub(super) fn provider_display_name(provider: &Value) -> String {
         .to_owned()
 }
 
-/// 把 `provider.apiFormat` 字段的字面值规范化成两个枚举之一:
-/// `"openai_chat"` / `"responses"`。
+/// 把 `provider.apiFormat` 字段的字面值规范化成后端可持久化的 canonical 值。
 ///
 /// **未知值 / 缺失 fallback 到 `"openai_chat"`**(跟 `Provider::api_format`
 /// schema serde default 一致),这是项目的核心默认行为:**所有 provider 默认
 /// 走代理,代理负责 chat ↔ responses 协议转换 + extras 注入 + model 改写**。
 ///
-/// `apiFormat == "responses"` 表示客户端可能发 Responses 风格协议,我们用
-/// `ResponsesAdapter` 在代理层做协议转换 —— **不是**"上游原生 Responses 透传"
-/// (历史 v1.x 误读)。`anthropic` / `claude` / `messages` 同理走 ResponsesAdapter。
+/// `responses` / `openai_responses` 保持 OpenAI Responses 语义。历史
+/// `anthropic` / `claude` / `messages` 别名现在归一到 `anthropic_messages`,
+/// 交给 AnthropicMessagesAdapter 做 Responses ↔ Anthropic Messages 转换。
 pub(super) fn normalize_provider_api_format(api_format: Option<&str>) -> &'static str {
-    match api_format
+    let normalized = api_format
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
-        .as_str()
-    {
-        "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => "responses",
+        .replace('-', "_");
+    match normalized.as_str() {
+        "responses" | "openai_responses" => "responses",
+        "anthropic_messages" | "anthropic" | "claude" | "messages" | "claude_messages" => {
+            "anthropic_messages"
+        }
         // Gemini native generateContent path(GeminiNativeAdapter)— 测速 / compat
         // 走 `/v1beta/models` 探测 + `x-goog-api-key` header,跟 chat completions
         // 完全不同的协议形态,必须独立分支。
         "gemini_native" | "google_ai_studio" | "gemini" => "gemini_native",
+        "gemini_cli_oauth" | "gemini_cli" | "gemini_oauth" | "google_oauth_cloud_code" => {
+            "gemini_cli_oauth"
+        }
+        "antigravity_oauth" | "antigravity" | "google_oauth_antigravity" => "antigravity_oauth",
+        "grok_web" | "grok" | "grok_com" => "grok_web",
         // openai / openai_chat / chat_completions / 空字符串 / 未知值
         // → 一律走 "openai_chat" — 跟 schema serde default 一致
         _ => "openai_chat",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_provider_api_format;
+
+    #[test]
+    fn normalize_provider_api_format_keeps_protocol_canonicals() {
+        for alias in [
+            "anthropic_messages",
+            "anthropic",
+            "claude",
+            "messages",
+            "claude-messages",
+        ] {
+            assert_eq!(
+                normalize_provider_api_format(Some(alias)),
+                "anthropic_messages"
+            );
+        }
+        for alias in ["responses", "openai-responses"] {
+            assert_eq!(normalize_provider_api_format(Some(alias)), "responses");
+        }
+        for alias in ["gemini_cli_oauth", "gemini-cli", "gemini_oauth"] {
+            assert_eq!(
+                normalize_provider_api_format(Some(alias)),
+                "gemini_cli_oauth"
+            );
+        }
+        for alias in [
+            "antigravity_oauth",
+            "antigravity",
+            "google-oauth-antigravity",
+        ] {
+            assert_eq!(
+                normalize_provider_api_format(Some(alias)),
+                "antigravity_oauth"
+            );
+        }
+        for alias in ["grok_web", "grok", "grok-com"] {
+            assert_eq!(normalize_provider_api_format(Some(alias)), "grok_web");
+        }
+    }
+
+    #[test]
+    fn normalize_provider_api_format_defaults_to_openai_chat() {
+        assert_eq!(normalize_provider_api_format(None), "openai_chat");
+        assert_eq!(normalize_provider_api_format(Some("")), "openai_chat");
+        assert_eq!(
+            normalize_provider_api_format(Some("unknown-protocol")),
+            "openai_chat"
+        );
     }
 }
 

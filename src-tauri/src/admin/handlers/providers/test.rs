@@ -29,6 +29,15 @@ pub(super) fn build_provider_test_url(base_url: &str, api_format: &str) -> Strin
         }
         return format!("{clean}/v1beta/models");
     }
+    if api_format == "anthropic_messages" {
+        if lower.ends_with("/v1/messages") || lower.ends_with("/messages") {
+            return clean.to_owned();
+        }
+        if lower.ends_with("/v1") {
+            return format!("{clean}/messages");
+        }
+        return format!("{clean}/v1/messages");
+    }
     if api_format == "openai_chat" {
         if lower.ends_with("/chat/completions") {
             return clean.to_owned();
@@ -46,7 +55,7 @@ pub(super) fn build_provider_test_url(base_url: &str, api_format: &str) -> Strin
 
 fn provider_test_body(provider: &Value, api_format: &str) -> Value {
     let model = provider_test_model(provider);
-    if api_format == "openai_chat" {
+    if api_format == "openai_chat" || api_format == "anthropic_messages" {
         return json!({
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
@@ -68,6 +77,14 @@ pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    if api_format == "anthropic_messages" {
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+    }
 
     if !api_key.is_empty() {
         let auth_scheme = provider
@@ -203,6 +220,22 @@ fn provider_compatibility_item(provider: &Value) -> Value {
             },
         });
     }
+    if api_format == "anthropic_messages" {
+        return json!({
+            "id": id,
+            "name": name,
+            "apiFormat": api_format,
+            "level": "experimental",
+            "message": "Anthropic Messages 本地转换：Codex.app /responses → Anthropic /messages；真实 Claude 验证完成后再开放预设。",
+            "checks": {
+                "models": true,
+                "text": true,
+                "stream": true,
+                "tools": true,
+                "streamingTools": true,
+            },
+        });
+    }
     json!({
         "id": id,
         "name": name,
@@ -220,12 +253,8 @@ fn provider_compatibility_item(provider: &Value) -> Value {
 }
 
 async fn test_provider_connection(provider: &Value) -> Value {
-    let api_format = normalize_provider_api_format(
-        provider
-            .get("apiFormat")
-            .and_then(|v| v.as_str())
-            .or(Some("responses")),
-    );
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
     let base_url = build_provider_test_url(
         provider
             .get("baseUrl")
@@ -459,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_test_url_anthropic_messages_uses_messages_endpoint() {
+        assert_eq!(
+            build_provider_test_url("https://api.anthropic.com/v1", "anthropic_messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            build_provider_test_url("https://api.anthropic.com", "anthropic_messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            build_provider_test_url(
+                "https://proxy.example/anthropic/v1/messages",
+                "anthropic_messages"
+            ),
+            "https://proxy.example/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
     fn provider_test_url_gemini_native_uses_models_endpoint() {
         // Gemini native:用 /v1beta/models 探测(不带 key 走 401 / "auth not verified",
         // 带 key 200)。base_url 不带版本号 → 自动补 /v1beta/models。
@@ -489,6 +537,27 @@ mod tests {
                 "gemini_native"
             ),
             "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn provider_test_headers_anthropic_messages_includes_version_and_allows_override() {
+        let provider = json!({
+            "apiFormat": "anthropic_messages",
+            "apiKey": "sk-ant-test",
+            "extraHeaders": {"anthropic-version": "2024-01-01"},
+        });
+        let headers = provider_test_headers(&provider, true);
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("2024-01-01"),
+            "用户 extraHeaders 必须能覆盖 Anthropic 默认版本头"
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
         );
     }
 
@@ -549,6 +618,82 @@ mod tests {
                 "apiFormat": "openai_chat",
                 "apiKey": "test-key",
                 "models": {"default": "deepseek-chat"}
+            });
+            let result = test_provider_connection(&provider).await;
+            server.abort();
+
+            assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(result.get("statusCode").and_then(|v| v.as_u64()), Some(200));
+        });
+    }
+
+    #[test]
+    fn provider_connection_posts_anthropic_messages_ping_with_version_header() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{
+                body::Bytes,
+                http::{HeaderMap as AxumHeaderMap, Method, StatusCode as AxumStatusCode},
+                routing::any,
+                Router,
+            };
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/messages",
+                any(
+                    |method: Method, headers: AxumHeaderMap, body: Bytes| async move {
+                        if method != Method::POST {
+                            return (
+                                AxumStatusCode::METHOD_NOT_ALLOWED,
+                                Json(json!({"error": "POST only"})),
+                            );
+                        }
+                        let parsed: Value =
+                            serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                        let has_version = headers
+                            .get("anthropic-version")
+                            .and_then(|v| v.to_str().ok())
+                            == Some("2023-06-01");
+                        let has_messages = parsed
+                            .get("messages")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items.len() == 1
+                                    && items[0] == json!({"role": "user", "content": "ping"})
+                            })
+                            .unwrap_or(false);
+                        if has_version && has_messages && parsed.get("input").is_none() {
+                            (
+                                AxumStatusCode::OK,
+                                Json(json!({"id": "msg_ok", "content": []})),
+                            )
+                        } else {
+                            (
+                                AxumStatusCode::BAD_REQUEST,
+                                Json(json!({"error": "bad anthropic ping"})),
+                            )
+                        }
+                    },
+                ),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let provider = json!({
+                "name": "Mock Claude",
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "anthropic_messages",
+                "authScheme": "none",
+                "models": {"default": "claude-sonnet-4-6"}
             });
             let result = test_provider_connection(&provider).await;
             server.abort();
@@ -780,8 +925,9 @@ mod tests {
             "name": "Legacy",
             "apiFormat": "anthropic",
         }));
-        assert_eq!(legacy_alias["apiFormat"], json!("responses"));
-        assert_eq!(legacy_alias["level"], json!("stable"));
+        assert_eq!(legacy_alias["apiFormat"], json!("anthropic_messages"));
+        assert_eq!(legacy_alias["level"], json!("experimental"));
         assert_eq!(legacy_alias["checks"]["models"], json!(true));
+        assert_eq!(legacy_alias["checks"]["streamingTools"], json!(true));
     }
 }

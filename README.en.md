@@ -14,9 +14,9 @@
   <a href="https://github.com/Cmochance/codex-app-transfer/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads"></a>
 </p>
 
-Codex App Transfer is a lightweight desktop config + forwarding tool for the **OpenAI Codex CLI**. It runs a local gateway that translates Codex CLI's Responses API requests (HTTP streaming / non-streaming + `/responses` fallback) into Chat Completions / Gemini Native / Grok Web / other upstream formats, then forwards them to your chosen provider.
+Codex App Transfer is a lightweight desktop config + forwarding tool for the **OpenAI Codex CLI**. It runs a local gateway that translates Codex CLI's Responses API requests (HTTP streaming / non-streaming + `/responses` fallback) into Chat Completions / Gemini Native / Anthropic Messages / Grok Web / other upstream formats, then forwards them to your chosen provider.
 
-Unlike `farion1231/cc-switch` and similar Anthropic-oriented Claude Code tools, this project focuses on **OpenAI Codex CLI**: manage providers, model mapping, forwarding ports, and a logs panel from a desktop UI so Codex CLI can talk to any third-party OpenAI / Gemini / Grok inference endpoint.
+Unlike `farion1231/cc-switch` and similar Anthropic-oriented Claude Code tools, this project focuses on **OpenAI Codex CLI**: manage providers, model mapping, forwarding ports, and a logs panel from a desktop UI so Codex CLI can talk to any third-party OpenAI / Gemini / Claude-compatible / Grok inference endpoint.
 
 After starting forwarding, Codex CLI talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
@@ -39,7 +39,7 @@ With any provider enabled, Codex CLI's model picker shows `<provider> / <real-mo
 ## What it does
 
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs
-- Translate Codex CLI's Responses API streaming / non-streaming requests into upstream protocols: Chat Completions, Gemini Native (`:streamGenerateContent`), Gemini CLI OAuth (Cloud Code Assist), Grok Web (`/rest/app-chat/conversations/new`), Responses passthrough, etc.
+- Translate Codex CLI's Responses API streaming / non-streaming requests into upstream protocols: Chat Completions, Gemini Native (`:streamGenerateContent`), Gemini CLI OAuth (Cloud Code Assist), Anthropic Messages (`/v1/messages`), Grok Web (`/rest/app-chat/conversations/new`), Responses passthrough, etc.
 - Multi-turn tool conversation context + `previous_response_id` history replay + autocompact expansion + thinking / reasoning_content injection — all aligned with the OpenAI Responses API protocol
 - **Two-layer session history persistence**: L1 in-memory LRU + L2 sqlite with 30-day TTL (`~/.codex-app-transfer/sessions.db`), preserving history across `.app` restarts
 - Codex CLI config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
@@ -89,6 +89,7 @@ If the desktop window can't open (rare — usually Tauri webview init failed / s
 | MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400) |
 | Google AI Studio (`gemini_native`) | ✅ | ✅ | ✅ | Auto-selects Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` |
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | Browser login once; no API key needed |
+| Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Anyrouter preset forces inbound model aliases to default and supports Anthropic native web search; generic Claude preset pending real validation |
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending |
 | Zhipu GLM / Alibaba Cloud Bailian | ⚠️ experimental | — | — | OpenAI Chat-compatible reverse proxy |
@@ -163,7 +164,7 @@ The current Windows build is not Authenticode-signed. The Release page provides 
 ## Tech Stack
 
 - **Backend / forwarding**: Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio
-- **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
+- **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
 - **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json}` (Codex CLI integration)

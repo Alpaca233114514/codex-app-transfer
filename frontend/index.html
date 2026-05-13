@@ -165,7 +165,7 @@
                   <select class="form-control form-control-lg" id="providerApiFormatSelect" name="apiFormatSelect">
                     <option value="openai_chat" data-i18n="apiFormatDisplay.openaiChat.name">OpenAI Chat</option>
                     <option value="responses" data-i18n="apiFormatDisplay.responses.name">Responses</option>
-                    <option value="anthropic" data-i18n="apiFormatDisplay.anthropic.name">Anthropic Messages</option>
+                    <option value="anthropic_messages" data-i18n="apiFormatDisplay.anthropic.name">Anthropic Messages</option>
                     <option value="gemini_native" data-i18n="apiFormatDisplay.geminiNative.name">Gemini Native</option>
                     <option value="gemini_cli_oauth" data-i18n="apiFormatDisplay.geminiCliOauth.name">Gemini CLI(OAuth)</option>
                     <option value="antigravity_oauth" data-i18n="apiFormatDisplay.antigravityOauth.name">Antigravity(OAuth)</option>
@@ -421,7 +421,7 @@
                 <button class="btn btn-outline-primary btn-sm" type="button" data-action="check-provider-compatibility"><i class="bi bi-patch-check"></i><span data-i18n="settings.checkCompatibility">检查兼容性</span></button>
               </div>
               <div class="compatibility-list" id="providerCompatibilityList"></div>
-              <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">一键检查所有 provider 实际可用性。协议类型由系统按 provider 能力锁定;后续版本将开放原生 Responses 透传等其他协议路由。</p>
+              <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">一键检查所有 provider 实际可用性。自定义 provider 可选择 OpenAI Chat 本地转换、原生 Responses 透传、Anthropic Messages 本地转换等协议路由。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">
@@ -567,7 +567,7 @@
             <div class="guide-card guide-card-static">
               <i class="bi bi-speedometer2"></i>
               <h3 data-i18n="guide.tsSpeedTitle">测速 / 兼容性失败?</h3>
-              <p data-i18n="guide.tsSpeedText">如果测速失败,先确认 baseUrl 与 API Key 对得上。v2.0.10 起所有 provider 的 API 协议默认 <strong>chat/completions</strong>,内置预设(Kimi / Kimi Code / DeepSeek / 智谱 / 百炼 / Xiaomi MiMo)在加载时按 baseUrl 自动命中并强制写回预设字面值,无需手动切。自建反代(baseUrl 不命中任何预设)请保持 chat/completions;仅当上游明确实现 OpenAI Responses API 时才选 responses。</p>
+              <p data-i18n="guide.tsSpeedText">如果测速失败,先确认 baseUrl 与 API Key 对得上。v2.x 起所有 provider 的协议类型由系统统一管理:内置预设按 baseUrl 自动命中,自定义 provider 默认 <strong>chat/completions</strong>;仅当上游明确实现 OpenAI Responses API 时才选 Responses,Claude / Anthropic 上游请选择 Anthropic Messages 本地转换。</p>
             </div>
           </div>
         </section>
