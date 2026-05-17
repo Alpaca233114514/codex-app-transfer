@@ -93,6 +93,7 @@ related_pr: <PR# 或 null>
 - [#34 P2 客户端 latest.json + installer RSA 验签(签了但客户端不验)](followup/34-update-client-rsa-signature-verify.md) — 公钥+CI签名都在,只差客户端 verify;MITM 改 sha256 即可推任意 installer
 - [#35 P3 macOS update 加 translocation / quarantine 前置检查](followup/35-macos-update-translocation-quarantine-precheck.md) — 借鉴 AiMaMi update.rs:47-113;场景 dmg 直跑用户升级失败 + quarantine 二次弹窗
 - [#36 P3 Windows update 走 NSIS /D=install_dir 保持安装目录](followup/36-windows-update-nsis-install-dir-preserve.md) — 借鉴 AiMaMi update.rs:7-23;非默认目录用户升级会双装或回 C:\Program Files
+- [#37 P3 update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测](followup/37-download-asset-toctou-and-bad-sha-test.md) — PR #196 review 派生, Linux 共享 /tmp TOCTOU window + 丢的 sha256 测试 re-add
 
 ---
 
