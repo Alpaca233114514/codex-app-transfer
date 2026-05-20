@@ -1,8 +1,9 @@
-//! `/api/codex/mcp-toml/*` — Codex CLI `~/.codex/config.toml` 中 `[mcp_servers.*]` 段
-//! 的受管块管理(借鉴 borawong/AiMaMi:src-tauri/src/core/mcp.rs).
+//! `/api/codex/memories-md/*` — Codex CLI `~/.codex/memories/MEMORY.md` 受管块管理.
 //!
-//! 6 endpoints 跟 agents_md.rs 完全对称,差异只在 target_path + block_type + marker
-//! style (TOML 走行注释 `#` 而非 HTML 注释 `<!-- -->`)。
+//! 跟 agents_md.rs 6 endpoints 完全对称, 差异只在 target_path + block_type。
+//! MEMORY.md 是 209k+ 层次化 markdown(`# Task Group → ## Task → ### subsections`),
+//! 跟 Claude Code MEMORY.md 索引模式一致 — app 通过 marker 区物理隔离,
+//! 永远不动用户长期积累的 209k 用户区。
 
 use std::path::PathBuf;
 
@@ -10,7 +11,9 @@ use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::super::services::managed_block::{ManagedBlock, ManagedBlockError, TomlManagedBlock};
+use super::super::services::managed_block::{
+    ManagedBlock, ManagedBlockError, MarkdownManagedBlock,
+};
 use super::common::err;
 
 fn resolve_home() -> Option<PathBuf> {
@@ -20,15 +23,17 @@ fn resolve_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn build_block() -> Result<TomlManagedBlock, String> {
+/// target = `~/.codex/memories/MEMORY.md` (层次化 markdown 索引)
+/// history = `~/.codex-app-transfer/managed-history/memories.json`
+fn build_block() -> Result<MarkdownManagedBlock, String> {
     let home = resolve_home().ok_or_else(|| "HOME / USERPROFILE not set".to_owned())?;
-    Ok(TomlManagedBlock {
-        block_type: "mcp",
-        target: home.join(".codex").join("config.toml"),
+    Ok(MarkdownManagedBlock {
+        block_type: "memories",
+        target: home.join(".codex").join("memories").join("MEMORY.md"),
         history: home
             .join(".codex-app-transfer")
             .join("managed-history")
-            .join("mcp.json"),
+            .join("memories.json"),
     })
 }
 

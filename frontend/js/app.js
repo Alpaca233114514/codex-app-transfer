@@ -2860,7 +2860,7 @@
         await codexBlockToggleHistory(currentCodexBlockType());
       }
       if (action === "codex-block-clear") {
-        if (window.confirm("确认 Clear 受管块?会删除 marker + 内容(进 history 可 rollback)")) {
+        if (window.confirm(t("codex.confirmClear"))) {
           await codexBlockClear(currentCodexBlockType());
         }
       }
@@ -2868,7 +2868,7 @@
         const idx = Number(actionEl.dataset.idx);
         const type = actionEl.dataset.type || currentCodexBlockType();
         if (!Number.isFinite(idx)) return;
-        if (window.confirm(`确认 Rollback ${type} 到 history[${idx}]?`)) {
+        if (window.confirm(tFmt("codex.confirmRollback", { type, idx }))) {
           await codexBlockRollback(type, idx);
         }
       }
@@ -2881,7 +2881,7 @@
       if (action === "codex-skills-restore") {
         const filename = actionEl.dataset.filename;
         if (!filename) return;
-        if (window.confirm(`确认从 ${filename} 还原 skills/?会覆盖当前 ~/.codex/skills 内容!`)) {
+        if (window.confirm(tFmt("codex.confirmSkillsRestore", { filename }))) {
           await codexSkillsRestore(filename);
         }
       }
@@ -2895,7 +2895,9 @@
 
   /** URL prefix for managed-block endpoints */
   function codexBlockUrl(type) {
-    return type === "mcp" ? "/api/codex/mcp-toml" : "/api/codex/agents-md";
+    if (type === "mcp") return "/api/codex/mcp-toml";
+    if (type === "memories") return "/api/codex/memories-md";
+    return "/api/codex/agents-md";
   }
 
   function currentCodexTab() {
@@ -2904,7 +2906,9 @@
 
   function currentCodexBlockType() {
     const tab = currentCodexTab();
-    return tab === "mcp" ? "mcp" : "agents";
+    if (tab === "mcp") return "mcp";
+    if (tab === "memories") return "memories";
+    return "agents";
   }
 
   async function codexBlockFetchStatus(type) {
@@ -2919,18 +2923,23 @@
     if (!el) return;
     const lastApply = status.lastApply
       ? new Date(status.lastApply * 1000).toLocaleString()
-      : "无";
-    const stateLabel = status.hasManaged ? "已注入" : "未注入";
+      : t("codex.statusNone");
+    const stateLabel = status.hasManaged ? t("codex.statusManaged") : t("codex.statusEmpty");
     el.innerHTML = `<i class="bi bi-info-circle"></i><p>
-      <strong>受管块状态(${type}):</strong> ${stateLabel}<br>
-      <strong>用户区(marker 外):</strong> ${status.beforeUserBytes + status.afterUserBytes} bytes<br>
-      <strong>历史快照:</strong> ${status.historyCount} 条(上限 10)<br>
-      <strong>上次 apply:</strong> ${lastApply}<br>
-      <strong>目标文件:</strong> <code>${escapeHtml(status.targetPath || "")}</code>
+      <strong>${escapeHtml(t("codex.statusBlockState"))}(${escapeHtml(type)}):</strong> ${escapeHtml(stateLabel)}<br>
+      <strong>${escapeHtml(t("codex.statusUserBytes"))}:</strong> ${status.beforeUserBytes + status.afterUserBytes} ${escapeHtml(t("codex.statusBytesSuffix"))}<br>
+      <strong>${escapeHtml(t("codex.statusHistoryCount"))}:</strong> ${status.historyCount} ${escapeHtml(t("codex.statusHistoryCountSuffix"))}<br>
+      <strong>${escapeHtml(t("codex.statusLastApply"))}:</strong> ${escapeHtml(lastApply)}<br>
+      <strong>${escapeHtml(t("codex.statusTargetFile"))}:</strong> <code>${escapeHtml(status.targetPath || "")}</code>
     </p>`;
     const ta = $("#codexBlockContent");
-    if (ta && status.managedContent !== undefined && !ta.dataset.dirty) {
-      ta.value = status.managedContent || "";
+    if (ta) {
+      if (status.outerSignature !== undefined) {
+        ta.dataset.outerSignature = status.outerSignature;
+      }
+      if (status.managedContent !== undefined && !ta.dataset.dirty) {
+        ta.value = status.managedContent || "";
+      }
     }
   }
 
@@ -2951,27 +2960,32 @@
   }
 
   async function codexBlockApply(type) {
-    const content = $("#codexBlockContent")?.value ?? "";
+    const ta = $("#codexBlockContent");
+    const content = ta?.value ?? "";
+    const expectedOuterSignature = ta?.dataset?.outerSignature || null;
+    const body = { content };
+    if (expectedOuterSignature) {
+      body.expectedOuterSignature = expectedOuterSignature;
+    }
     const r = await fetch(`${codexBlockUrl(type)}/apply`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || "apply failed");
     }
-    const ta = $("#codexBlockContent");
     if (ta) delete ta.dataset.dirty;
     await codexBlockLoadAndRender(type);
-    showToast(`${type} 受管块已 apply`);
+    showToast(tFmt("codex.toastApplied", { type }));
   }
 
   async function codexBlockClear(type) {
     const r = await fetch(`${codexBlockUrl(type)}/clear`, { method: "POST" });
     if (!r.ok) throw new Error("clear failed");
     await codexBlockLoadAndRender(type);
-    showToast(`${type} 受管块已 clear(进 history)`);
+    showToast(tFmt("codex.toastCleared", { type }));
   }
 
   async function codexBlockRollback(type, idx) {
@@ -2986,7 +3000,7 @@
     }
     await codexBlockLoadAndRender(type);
     await codexBlockRenderHistory(type);
-    showToast(`已 rollback ${type} 到 history[${idx}]`);
+    showToast(tFmt("codex.toastRollbacked", { type, idx }));
   }
 
   async function codexBlockRenderHistory(type) {
@@ -3006,7 +3020,8 @@
         <pre style="font-size: 12px; max-height: 60px; overflow: hidden; margin: 4px 0 0; color: var(--muted);">${escapeHtml(preview) || "(empty)"}</pre>
       </li>`;
     });
-    list.innerHTML = items.join("") || "<li><em>暂无 history snapshot</em></li>";
+    list.innerHTML =
+      items.join("") || `<li><em>${escapeHtml(t("codex.historyEmpty"))}</em></li>`;
   }
 
   async function codexBlockToggleHistory(type) {
@@ -3033,24 +3048,30 @@
 
     const statusEl = $("#codexSkillsStatus");
     if (statusEl) {
+      const countSuffix = t("codex.skillsCountSuffix");
+      const backupsSuffix = t("codex.skillsBackupsCountSuffix");
       statusEl.innerHTML = `<i class="bi bi-info-circle"></i><p>
-        <strong>Skills 目录:</strong> <code>${escapeHtml(list.skillsDir || "")}</code><br>
-        <strong>已安装 skill:</strong> ${list.count} 个<br>
-        <strong>备份目录:</strong> <code>${escapeHtml(backups.backupDir || "")}</code><br>
-        <strong>已有备份:</strong> ${backups.count} 份
+        <strong>${escapeHtml(t("codex.skillsDirLabel"))}:</strong> <code>${escapeHtml(list.skillsDir || "")}</code><br>
+        <strong>${escapeHtml(t("codex.skillsInstalledLabel"))}:</strong> ${list.count}${countSuffix ? " " + escapeHtml(countSuffix) : ""}<br>
+        <strong>${escapeHtml(t("codex.skillsBackupDirLabel"))}:</strong> <code>${escapeHtml(backups.backupDir || "")}</code><br>
+        <strong>${escapeHtml(t("codex.skillsBackupsLabel"))}:</strong> ${backups.count}${backupsSuffix ? " " + escapeHtml(backupsSuffix) : ""}
       </p>`;
     }
 
     const ul = $("#codexSkillsList");
     if (ul) {
+      const filesSuffix = t("codex.skillsFilesSuffix");
       const rows = (list.entries || []).map((entry) => {
-        const md = entry.has_skill_md ? "✓ SKILL.md" : "✗ no SKILL.md";
+        const md = entry.has_skill_md
+          ? t("codex.skillsHasSkillMd")
+          : t("codex.skillsNoSkillMd");
         return `<li style="display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px dashed var(--line);">
           <span>${escapeHtml(entry.name)}</span>
-          <small style="color: var(--muted);">${md} · ${entry.files_count} files</small>
+          <small style="color: var(--muted);">${escapeHtml(md)} · ${entry.files_count} ${escapeHtml(filesSuffix)}</small>
         </li>`;
       });
-      ul.innerHTML = rows.join("") || "<li><em>暂无 skill</em></li>";
+      ul.innerHTML =
+        rows.join("") || `<li><em>${escapeHtml(t("codex.skillsListEmpty"))}</em></li>`;
     }
 
     const backupList = $("#codexSkillsBackupsList");
@@ -3063,7 +3084,8 @@
           <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-skills-restore" data-filename="${escapeHtml(entry.filename)}"><i class="bi bi-arrow-counterclockwise"></i> Restore</button>
         </li>`;
       });
-      backupList.innerHTML = rows.join("") || "<li><em>暂无备份(点 Backup now 创建)</em></li>";
+      backupList.innerHTML =
+        rows.join("") || `<li><em>${escapeHtml(t("codex.backupsListEmpty"))}</em></li>`;
     }
   }
 
@@ -3074,7 +3096,7 @@
       throw new Error(err.error || "backup failed");
     }
     const j = await r.json();
-    showToast(`备份完成: ${j.backupPath?.split("/").pop() || "ok"}`);
+    showToast(tFmt("codex.toastSkillsBackedUp", { name: j.backupPath?.split("/").pop() || "ok" }));
     await codexSkillsLoadAndRender();
   }
 
@@ -3088,7 +3110,7 @@
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || "restore failed");
     }
-    showToast(`已从 ${filename} 还原`);
+    showToast(tFmt("codex.toastSkillsRestored", { filename }));
     await codexSkillsLoadAndRender();
   }
 
@@ -3098,7 +3120,7 @@
   function codexShowTab(tab) {
     const blockPane = $("#codexBlockTab");
     const skillsPane = $("#codexSkillsTab");
-    const wantBlock = tab === "agents" || tab === "mcp";
+    const wantBlock = tab === "agents" || tab === "mcp" || tab === "memories";
     if (blockPane) {
       blockPane.hidden = !wantBlock;
       blockPane.classList.toggle("active", wantBlock);
@@ -3107,6 +3129,13 @@
       skillsPane.hidden = tab !== "skills";
       skillsPane.classList.toggle("active", tab === "skills");
     }
+    // 切 tab 时收起 History 面板和 Preview 区域,防止残留的 rollback 按钮
+    // data-type 指向旧 tab 导致 rollback 操作类型错误 (Devin Review BUG_..._0001)
+    const historyEl = $("#codexBlockHistory");
+    if (historyEl) historyEl.hidden = true;
+    const previewEl = $("#codexBlockPreviewArea");
+    if (previewEl) previewEl.hidden = true;
+
     // sidebar item active state
     $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.codexTab === tab);
@@ -3126,9 +3155,10 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agents, mcp, skills] = await Promise.all([
+      const [agents, mcp, memories, skills] = await Promise.all([
         fetch("/api/codex/agents-md/status").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/memories-md/status").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
@@ -3137,6 +3167,7 @@
       };
       setBadge("#codexSidebarBadge-agents", agents?.hasManaged ? "ON" : "—");
       setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-memories", memories?.hasManaged ? "ON" : "—");
       setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
     } catch {
       // best-effort, 静默
