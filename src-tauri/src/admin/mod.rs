@@ -306,6 +306,89 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/skills/restore",
             post(handlers::skills::restore_handler),
         )
+        // Skills SKILL.md raw 编辑 + 打开文件夹(新)
+        .route(
+            "/api/codex/skills-md/paths",
+            get(handlers::skills_md::list_paths),
+        )
+        .route(
+            "/api/codex/skills-md/raw",
+            get(handlers::skills_md::raw_get).post(handlers::skills_md::raw_write),
+        )
+        .route(
+            "/api/codex/skills-md/backup",
+            post(handlers::skills_md::backup),
+        )
+        .route(
+            "/api/codex/skills-md/restore-raw",
+            post(handlers::skills_md::restore_raw),
+        )
+        .route(
+            "/api/codex/skills-md/history",
+            get(handlers::skills_md::history),
+        )
+        .route(
+            "/api/codex/skills-md/reveal",
+            post(handlers::skills_md::reveal),
+        )
+        // MCP — 结构化重做(Servers form + Plugins + Marketplace)
+        .route(
+            "/api/codex/mcp/servers",
+            get(handlers::mcp::list_servers).post(handlers::mcp::upsert_server),
+        )
+        .route(
+            "/api/codex/mcp/servers/delete",
+            post(handlers::mcp::delete_server),
+        )
+        .route(
+            "/api/codex/mcp/servers/backup",
+            post(handlers::mcp::backup_servers),
+        )
+        .route(
+            "/api/codex/mcp/servers/restore",
+            post(handlers::mcp::restore_servers),
+        )
+        .route(
+            "/api/codex/mcp/servers/history",
+            get(handlers::mcp::history_servers),
+        )
+        .route(
+            "/api/codex/mcp/config/raw",
+            get(handlers::mcp::raw_get_config).post(handlers::mcp::raw_write_config),
+        )
+        .route("/api/codex/mcp/plugins", get(handlers::mcp::list_plugins))
+        .route(
+            "/api/codex/mcp/plugins/toggle",
+            post(handlers::mcp::toggle_plugin),
+        )
+        .route(
+            "/api/codex/mcp/plugins/uninstall",
+            post(handlers::mcp::uninstall_plugin),
+        )
+        .route(
+            "/api/codex/mcp/plugins/install",
+            post(handlers::mcp::install_plugin),
+        )
+        .route(
+            "/api/codex/mcp/marketplace/sources",
+            get(handlers::mcp::list_sources),
+        )
+        .route(
+            "/api/codex/mcp/marketplace/sources/add",
+            post(handlers::mcp::add_source),
+        )
+        .route(
+            "/api/codex/mcp/marketplace/sources/remove",
+            post(handlers::mcp::remove_source),
+        )
+        .route(
+            "/api/codex/mcp/marketplace/sources/toggle",
+            post(handlers::mcp::toggle_source),
+        )
+        .route(
+            "/api/codex/mcp/marketplace/index",
+            get(handlers::mcp::marketplace_index),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)
