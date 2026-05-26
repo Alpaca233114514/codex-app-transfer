@@ -1,0 +1,126 @@
+/* ============================================================
+   usage.css — Token 用量统计页 (#279)
+   形态参考 ryoppippi/ccusage Daily Report CLI 截图(等宽 + 简洁表格)。
+   ============================================================ */
+
+.usage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 顶部 view 切换器 + 刷新按钮同行,switcher 左,刷新右 */
+.usage-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.usage-view-switcher {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--soft-surface);
+  border-radius: 8px;
+  width: fit-content;
+}
+
+.usage-view-btn {
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  transition: background 0.15s, color 0.15s;
+}
+
+.usage-view-btn:hover {
+  color: var(--text);
+}
+
+.usage-view-btn.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.usage-table-wrap {
+  padding: 0;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  /* 数字 tabular-nums 即可,不强制 monospace — system-ui 字符更窄,
+     字号小列也能放得下,避免横向 scroll(用户反馈) */
+  font-size: 0.8rem;
+  table-layout: auto;
+}
+
+.usage-table thead {
+  position: sticky;
+  top: 0;
+  /* 用实色 var(--surface) 不再 var(--bg-secondary) 这种不存在的 token,
+     之前 fallback 到 transparent 让滚动时跟数据叠在一起看不清(用户反馈) */
+  background: var(--surface);
+  z-index: 5;
+  box-shadow: 0 1px 0 var(--line);
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.usage-table th:first-child,
+.usage-table td:first-child {
+  text-align: left;
+}
+
+.usage-table th {
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.usage-table tbody tr:hover {
+  background: var(--soft-surface);
+}
+
+.usage-table .usage-row-total {
+  font-weight: 700;
+  background: var(--soft-surface);
+}
+
+/* Model 列 (header + body) 统一左对齐,跟其它右对齐的数字列形成对比 */
+.usage-table .usage-col-model,
+.usage-table .usage-cell-model {
+  text-align: left;
+}
+
+.usage-table .usage-cell-model {
+  color: var(--muted);
+  font-size: 0.74rem;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-empty,
+.usage-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+}

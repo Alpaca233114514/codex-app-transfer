@@ -1,5 +1,5 @@
 (function () {
-  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "settings", "codex", "theme", "guide"];
+  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "usage", "settings", "codex", "theme", "guide"];
   const providerFormModelSlots = [
     { key: "default", label: "Default", icon: "bi-circle-fill", iconClass: "default", source: "未配置映射时默认使用这一项", required: true },
     { key: "gpt_5_5", label: "gpt-5.5", icon: "bi-circle", iconClass: "default", source: "gpt-5.5" },
@@ -2231,10 +2231,186 @@
     if (route === "providers") await renderProviders();
     if (route === "desktop") await renderDesktop();
     if (route === "proxy") await renderProxy();
+    if (route === "usage") await renderUsage();
     if (route === "settings") await renderSettings();
     if (route === "codex") await renderCodexAssets();
     if (route === "theme") await renderTheme();
   }
+
+  // ── Usage 页 (#279) — token 统计 ────────────────────────────────────────────
+  // 数据流: GET /api/usage/summary → 后端 codex-app-transfer-usage-tracker
+  // 扫 ~/.codex/sessions/ rollout JSONL,解析层 vendor 自 ryoppippi/ccusage(MIT)。
+  let usageCache = null;
+  let usageActiveView = "daily"; // daily | model | conversation
+
+  function fmtNum(n) {
+    if (n === null || n === undefined) return "—";
+    return Number(n).toLocaleString();
+  }
+
+  function fmtLastActivity(s) {
+    if (!s) return "—";
+    // ccusage 写 RFC3339;表格列宽紧张,只显示 YYYY-MM-DD HH:MM(秒/ms/Z/offset 全省)
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
+    return m ? `${m[1]} ${m[2]}` : s;
+  }
+
+  function renderUsageKpis(report) {
+    const el = $("#usageKpis");
+    if (!el) return;
+    const kpis = [
+      { label: t("usage.kpi.totalInput"), value: fmtNum(report.totalInputTokens), icon: "bi-arrow-down-circle" },
+      { label: t("usage.kpi.totalOutput"), value: fmtNum(report.totalOutputTokens), icon: "bi-arrow-up-circle" },
+      { label: t("usage.kpi.totalTokens"), value: fmtNum(report.totalTokens), icon: "bi-stack" },
+      { label: t("usage.kpi.conversations"), value: fmtNum(report.totalConversations), icon: "bi-chat-square-text" },
+    ];
+    el.innerHTML = kpis.map((kpi) => `
+      <article class="stat-card"><i class="bi ${kpi.icon}"></i><div><span>${escapeHtml(kpi.label)}</span><strong>${escapeHtml(kpi.value)}</strong></div></article>
+    `).join("");
+  }
+
+  function renderUsageTable(report, view) {
+    const head = $("#usageTableHead");
+    const body = $("#usageTableBody");
+    const empty = $("#usageEmpty");
+    if (!head || !body || !empty) return;
+
+    let rows;
+    let firstColKey;
+    if (view === "daily") {
+      rows = report.daily || [];
+      firstColKey = "usage.col.date";
+    } else if (view === "model") {
+      rows = report.byModel || [];
+      firstColKey = "usage.col.model";
+    } else {
+      rows = report.byConversation || [];
+      firstColKey = "usage.col.conversation";
+    }
+
+    if (!rows.length) {
+      head.innerHTML = "";
+      body.innerHTML = "";
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+
+    // By Model 视图下 first column = model name,第二个 models 列内容必然跟 first
+    // 列重复(每个 group 只有自己一个 model)— Devin Review #280 BUG_..._0001 fix:
+    // model view 跳过第二列;daily / conversation view 保留(本日 / 本会话用到的
+    // 模型清单是补充信息有意义)。
+    const showModelsCol = view !== "model";
+    const modelHeader = showModelsCol ? `<th class="usage-col-model">${escapeHtml(t("usage.col.model"))}</th>` : "";
+
+    head.innerHTML = `
+      <tr>
+        <th>${escapeHtml(t(firstColKey))}</th>
+        ${modelHeader}
+        <th>${escapeHtml(t("usage.col.input"))}</th>
+        <th>${escapeHtml(t("usage.col.output"))}</th>
+        <th>${escapeHtml(t("usage.col.reasoning"))}</th>
+        <th>${escapeHtml(t("usage.col.total"))}</th>
+        <th>${escapeHtml(t("usage.col.turns"))}</th>
+        <th>${escapeHtml(t("usage.col.lastActivity"))}</th>
+      </tr>
+    `;
+
+    // ccusage daily 视图按日期降序;model / conversation 按 total tokens 降序
+    const sorted = rows.slice().sort((a, b) => {
+      if (view === "daily") return (b.group || "").localeCompare(a.group || "");
+      return (b.totalTokens || 0) - (a.totalTokens || 0);
+    });
+
+    body.innerHTML = sorted.map((row) => {
+      const modelCell = showModelsCol
+        ? `<td class="usage-cell-model">${escapeHtml((row.models || []).join(", ") || "—")}</td>`
+        : "";
+      return `
+      <tr>
+        <td>${escapeHtml(row.group || "—")}</td>
+        ${modelCell}
+        <td>${escapeHtml(fmtNum(row.inputTokens))}</td>
+        <td>${escapeHtml(fmtNum(row.outputTokens))}</td>
+        <td>${escapeHtml(fmtNum(row.reasoningOutputTokens))}</td>
+        <td><strong>${escapeHtml(fmtNum(row.totalTokens))}</strong></td>
+        <td>${escapeHtml(fmtNum(row.turnCount))}</td>
+        <td>${escapeHtml(fmtLastActivity(row.lastActivity))}</td>
+      </tr>
+      `;
+    }).join("");
+  }
+
+  async function fetchUsageReport() {
+    // 浏览器 tz:Intl.DateTimeFormat().resolvedOptions().timeZone
+    const tz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || "");
+    const res = await fetch(`/api/usage/summary?tz=${tz}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  function renderUsageError(message) {
+    // silent-failure-hunter PR #279 修:fetch 失败不再写空 cache 让 UI 误显示
+    // "0 用量",而是显示带 retry 的 error banner 让用户知道是 backend 错。
+    const head = $("#usageTableHead");
+    const body = $("#usageTableBody");
+    const empty = $("#usageEmpty");
+    const kpis = $("#usageKpis");
+    if (head) head.innerHTML = "";
+    if (body) body.innerHTML = "";
+    if (empty) empty.hidden = true;
+    if (kpis) {
+      kpis.innerHTML = `
+        <article class="stat-card danger" style="grid-column: 1 / -1;">
+          <i class="bi bi-exclamation-triangle"></i>
+          <div>
+            <span>${escapeHtml(t("usage.kpi.totalTokens"))}</span>
+            <strong style="font-size: 0.95rem;">${escapeHtml(message)}</strong>
+          </div>
+        </article>
+      `;
+    }
+  }
+
+  async function renderUsage(forceRefresh = false) {
+    const loading = $("#usageLoading");
+    if (!usageCache || forceRefresh) {
+      if (loading) loading.hidden = false;
+      try {
+        usageCache = await fetchUsageReport();
+      } catch (e) {
+        console.warn("cas: load usage failed", e);
+        if (loading) loading.hidden = true;
+        renderUsageError(`${t("usage.loadError")}: ${e?.message || e}`);
+        return;
+      } finally {
+        if (loading) loading.hidden = true;
+      }
+    }
+    renderUsageKpis(usageCache);
+    renderUsageTable(usageCache, usageActiveView);
+    if (usageCache.unknownTimestampEvents && usageCache.unknownTimestampEvents > 0) {
+      // 后端 Phase 1 加的字段:>0 说明 ts 解析失败,可能 Codex CLI 改 format
+      console.warn(`cas: ${usageCache.unknownTimestampEvents} events have unparseable timestamps`);
+    }
+  }
+
+  // delegate Usage 页交互
+  document.addEventListener("click", (e) => {
+    const viewBtn = e.target.closest(".usage-view-btn");
+    if (viewBtn) {
+      const view = viewBtn.dataset.usageView;
+      if (!view || view === usageActiveView) return;
+      usageActiveView = view;
+      $all(".usage-view-btn").forEach((b) => b.classList.toggle("active", b.dataset.usageView === view));
+      renderUsageTable(usageCache || { daily: [], byModel: [], byConversation: [] }, view);
+      return;
+    }
+    if (e.target.closest("#usageRefreshBtn")) {
+      usageCache = null;
+      renderUsage(true);
+    }
+  });
 
   let currentTheme = "default";
 
