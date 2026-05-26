@@ -2052,6 +2052,101 @@
     await refreshAppVersion();
     await refreshBackupList();
     await refreshCodexSnapshotStatus();
+    await refreshResidualScanStatus();
+  }
+
+  // #268 — Codex 原配置完整性自检渲染.
+  async function refreshResidualScanStatus() {
+    const statusEl = $("#residualScanStatus");
+    const repairBtn = $("#repairResidualBtn");
+    const previewEl = $("#residualScanPreview");
+    if (!statusEl) return;
+    statusEl.classList.remove("residual-clean", "residual-dirty");
+    statusEl.textContent = t("settings.residualScanStatusUnknown");
+    if (repairBtn) repairBtn.hidden = true;
+    if (previewEl) {
+      previewEl.hidden = true;
+      previewEl.textContent = "";
+    }
+    let report;
+    try {
+      report = await CCApi.scanResidualPollution();
+    } catch (error) {
+      statusEl.textContent = tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      });
+      return;
+    }
+    const count = (report?.polluted || []).length;
+    if (count === 0) {
+      statusEl.classList.add("residual-clean");
+      statusEl.textContent = report?.transferCurrentlyApplied
+        ? t("settings.residualScanStatusCleanWhileApplied")
+        : t("settings.residualScanStatusClean");
+      return;
+    }
+    statusEl.classList.add("residual-dirty");
+    statusEl.textContent = tFmt("settings.residualScanStatusDirty", { count });
+    if (repairBtn) repairBtn.hidden = false;
+  }
+
+  function formatResidualPreview(polluted) {
+    const lines = [];
+    for (const file of polluted) {
+      const kindLabel = (() => {
+        switch (file.kind) {
+          case "liveConfig":
+            return "~/.codex/config.toml";
+          case "activeSnapshot":
+            return "active snapshot";
+          case "recoverySnapshot":
+            return "recovery snapshot";
+          default:
+            return file.kind;
+        }
+      })();
+      lines.push(`[${kindLabel}] ${file.path}`);
+      for (const key of file.fieldsToStrip || []) {
+        lines.push(`  - ${key}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  async function handleRepairResidual() {
+    const previewEl = $("#residualScanPreview");
+    let scan;
+    try {
+      scan = await CCApi.scanResidualPollution();
+    } catch (error) {
+      showToast(tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      }));
+      return;
+    }
+    if (!scan?.polluted?.length) {
+      await refreshResidualScanStatus();
+      return;
+    }
+    const preview = formatResidualPreview(scan.polluted);
+    if (previewEl) {
+      previewEl.textContent = `${t("settings.residualScanPreviewTitle")}\n\n${preview}`;
+      previewEl.hidden = false;
+    }
+    if (!window.confirm(tFmt("settings.residualScanConfirm", { preview }))) {
+      return;
+    }
+    try {
+      const result = await CCApi.repairResidualPollution({ dryRun: false });
+      const cleaned = (result?.repair?.repaired || []).length;
+      showToast(tFmt("settings.residualScanToastCleaned", { count: cleaned }));
+    } catch (error) {
+      showToast(tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      }));
+    } finally {
+      await refreshResidualScanStatus();
+    }
   }
 
   async function refreshAppVersion() {
@@ -2702,6 +2797,16 @@
         }
         const fellBackToLegacy = result && result.restored === false;
         showToast(t(fellBackToLegacy ? "toast.desktopClearedLegacy" : "toast.desktopCleared"));
+      }
+
+      if (action === "rescan-residual") {
+        await refreshResidualScanStatus();
+        return;
+      }
+
+      if (action === "repair-residual") {
+        await handleRepairResidual();
+        return;
       }
 
       if (action === "proxy-start") {
@@ -6444,6 +6549,34 @@
     bindEvents();
     bindFeedbackEvents();
     bindThemeEvents();
+
+    // **race fix** (devin #269 review thread):Tauri 后端 startup hook 会在
+    // 3s 内 emit `residual-scan-report` 跟 `codex-deeplink`,如果监听 listener
+    // 注册晚于 `await CCApi.getSettings()` / `await renderRoute()` 等异步链
+    // 落地时点,event 已经 fire 完毕 → 启动 toast 静默丢失。把 listener 注册
+    // 提到 bindEvents() 紧后(showToast / tFmt / codexMcpHandleDeeplink 等
+    // 依赖此时都已初始化),先于所有 await,确保不漏 event。
+    try {
+      const tauriEvent = window.__TAURI__?.event;
+      if (tauriEvent && typeof tauriEvent.listen === "function") {
+        await tauriEvent.listen("codex-deeplink", (e) => {
+          const url = typeof e.payload === "string" ? e.payload : "";
+          if (url) codexMcpHandleDeeplink(url);
+        });
+        // #268 启动自检 emit `residual-scan-report` 含污染文件清单 → 弹 toast
+        // 提示用户去设置页查看。干净时 backend 不 emit,这里也不会触发。
+        await tauriEvent.listen("residual-scan-report", (e) => {
+          const report = e?.payload || {};
+          const count = (report.polluted || []).length;
+          if (count > 0) {
+            showToast(tFmt("settings.residualScanStartupToast", { count }));
+          }
+        });
+      }
+    } catch (err) {
+      console.error("event listen:", err);
+    }
+
     const settings = await CCApi.getSettings();
     const finalLang = settings.language || "zh";
     if (finalLang !== CCI18n.language) {
@@ -6453,18 +6586,5 @@
     applyTheme(settings.theme || "default");
     if (!window.location.hash) window.location.hash = "dashboard";
     await renderRoute(routeFromHash());
-
-    // Tauri deeplink listener — Rust backend emit("codex-deeplink", url) 时触发
-    try {
-      const event = window.__TAURI__?.event;
-      if (event && typeof event.listen === "function") {
-        await event.listen("codex-deeplink", (e) => {
-          const url = typeof e.payload === "string" ? e.payload : "";
-          if (url) codexMcpHandleDeeplink(url);
-        });
-      }
-    } catch (err) {
-      console.error("deeplink listen:", err);
-    }
   });
 })();
