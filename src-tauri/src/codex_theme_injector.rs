@@ -508,11 +508,11 @@ fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
 async fn drain_until_response(
     read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
     expected_id: u64,
-) -> Result<(), String> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         if tokio::time::Instant::now() > deadline {
-            return Err(format!("CDP response timeout for id={}", expected_id));
+            return Err(format!("CDP response timeout for id={}", expected_id).into());
         }
         match tokio::time::timeout(Duration::from_millis(500), read.next()).await {
             Ok(Some(Ok(WsMessage::Text(t)))) => {
@@ -528,14 +528,15 @@ async fn drain_until_response(
                     continue;
                 }
                 if let Some(err) = val.get("error") {
-                    return Err(format!("CDP error for id={}: {}", expected_id, err));
+                    return Err(format!("CDP error for id={}: {}", expected_id, err).into());
                 }
                 if let Some(exception) = val.get("result").and_then(|r| r.get("exceptionDetails"))
                 {
                     return Err(format!(
                         "CDP exception for id={}: {}",
                         expected_id, exception
-                    ));
+                    )
+                    .into());
                 }
                 return Ok(());
             }
@@ -545,7 +546,7 @@ async fn drain_until_response(
             }
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(e))) => {
-                return Err(format!("CDP read error: {}", e));
+                return Err(format!("CDP read error: {}", e).into());
             }
             Ok(None) => {
                 return Err("CDP connection closed".into());
