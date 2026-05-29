@@ -380,6 +380,19 @@
       return api('POST', '/api/desktop/repair-residual', { dryRun });
     },
 
+    // MOC-62 — MCP 凭据可移植保险箱:load 时查状态,文件丢失时用户确认恢复 / 忽略.
+    async getMcpCredentialsStatus() {
+      return api('GET', '/api/desktop/mcp-credentials/status');
+    },
+
+    async restoreMcpCredentials() {
+      return api('POST', '/api/desktop/mcp-credentials/restore');
+    },
+
+    async discardMcpCredentialsMirror() {
+      return api('POST', '/api/desktop/mcp-credentials/discard');
+    },
+
     // #271 — Codex CLI rollout 对话导出.
     async listConversations() {
       const data = await api('GET', '/api/conversations/list');

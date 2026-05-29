@@ -7,8 +7,9 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    get_snapshot_status, has_snapshot, list_snapshots, repair_residual_pollution,
-    restore_codex_snapshot, restore_codex_state, scan_residual_pollution, CodexPaths,
+    discard_mcp_mirror, get_snapshot_status, has_snapshot, list_snapshots,
+    repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
+    restore_mcp_credentials_from_mirror, scan_residual_pollution, CodexPaths,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,7 +22,8 @@ use crate::admin::registry_io::load as load_registry;
 pub use crate::admin::services::desktop::process::is_codex_app_running;
 pub use crate::admin::services::desktop::snapshot::{
     auto_apply_on_startup_if_enabled, codex_openai_api_key_present, desktop_health,
-    desktop_target_for_active_provider, read_codex_toml_root_string, restore_codex_if_enabled,
+    desktop_target_for_active_provider, mcp_credentials_on_setting_changed,
+    mcp_credentials_startup_sync, read_codex_toml_root_string, restore_codex_if_enabled,
     switch_provider_and_sync,
 };
 
@@ -224,6 +226,38 @@ pub async fn desktop_repair_residual(
         .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// MOC-62:用户在"MCP 凭据文件丢失,从备份恢复?"确认里点**恢复** → 把镜像写回 live。
+/// 仅当 live 仍缺失 / 空时才写(不覆盖已重新授权的 live);返回写回条数。
+pub async fn mcp_credentials_restore() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match restore_mcp_credentials_from_mirror(&paths) {
+        Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// MOC-62:用户点**忽略** → 删镜像,接受"凭据已不在",停止每次启动重复弹确认(非破坏:
+/// live 不动,日后重新授权会重新生成镜像)。
+pub async fn mcp_credentials_discard() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match discard_mcp_mirror(&paths) {
+        Ok(()) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// MOC-62:前端 load 时轮询 —— 是否有可恢复的 MCP 凭据备份(>0 → 弹恢复确认)。
+/// 比一次性 startup event 可靠(避免 event 在 listener 注册前 emit 丢失)。只读。
+pub async fn mcp_credentials_status() -> impl IntoResponse {
+    Json(json!({"restoreAvailable": snapshot::mcp_credentials_restore_status()})).into_response()
 }
 
 pub async fn desktop_snapshot_status() -> impl IntoResponse {
