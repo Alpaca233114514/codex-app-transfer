@@ -1529,45 +1529,57 @@ fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value
 }
 
 /// 从 chat function args(标准形态 `{"input": "<V4A patch>"}`)提取裸 V4A
-/// 文本,供 `custom_tool_call.input` 字段使用。
+/// 文本,供 `custom_tool_call.input` 字段使用,并做**非破坏性信封修复**
+/// (见 #302:chat function-call provider 无 lark grammar 受约束解码,模型
+/// 手搓的 V4A 信封常出错)。
 ///
-/// 降级路径分两类,通过 tracing 区分以便事后定位:
+/// body 来源优先级:
+/// 1. JSON `input` 字段(标准形态)。
+/// 2. 常见别名 key(`patch`/`diff`/… —— schema drift 回收,真机实测模型会发
+///    `{"patch": "*** Begin Patch…"}`),仅当值含 `*** Begin Patch` 才取。
+/// 3. 裸 V4A(JSON parse 失败但含 `*** Begin Patch`,可能被 markdown fence 包裹)。
 ///
-/// 1. **JSON parse 失败 + 看起来像裸 V4A**(以 `*** Begin Patch` 开头):
-///    debug 级,预期 happy path —— 上游 chat provider 把 freeform 工具
-///    输出原样透传未包 JSON。
-/// 2. **JSON parse 失败 + 不像 V4A**:warn 级,通常是 stream 截断 / UTF-8
-///    损坏 / 上游加 markdown fence。把整段透传给 Codex CLI 至少能让用户
-///    看到 `apply_patch verification failed: <parse_error>` 而不是 abort
-///    无线索。
-/// 3. **JSON valid 但缺 `input` 字段**:warn 级,通常是 schema drift
-///    (模型用了 `patch` 而不是 `input` 等)。整段透传暴露真坏。
-///
-/// 借鉴上游 `codex-rs/apply-patch/apply_patch_tool_instructions.md` 的
-/// V4A 格式约束。不做 V4A 语法校验 — 留给 Codex CLI 端的 `parse_patch`。
+/// 取到候选后过 [`repair_v4a_envelope`] 规整信封(剥 markdown fence / Begin 前
+/// End 后的杂散行)。取不到候选(截断 / 非 V4A 垃圾)则**原样透传**,交给 Codex
+/// CLI `parse_patch` 暴露真坏 —— 绝不静默吞、不截断正文。不做 V4A 语法校验。
 fn extract_apply_patch_input(args_acc: &str) -> String {
     let trimmed = args_acc.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(parsed) => match parsed.get("input").and_then(Value::as_str) {
-            Some(s) => s.to_owned(),
-            None => {
+    let candidate: Option<String> = match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) => {
+            if let Some(s) = parsed.get("input").and_then(Value::as_str) {
+                Some(s.to_owned())
+            } else if let Some((alt_key, s)) = APPLY_PATCH_ALT_KEYS.iter().find_map(|k| {
+                parsed
+                    .get(*k)
+                    .and_then(Value::as_str)
+                    .filter(|s| s.contains("*** Begin Patch"))
+                    .map(|s| (*k, s))
+            }) {
+                tracing::warn!(
+                    target: "adapters::apply_patch",
+                    alt_key,
+                    "apply_patch JSON 缺 `input`,从别名 key 回收 V4A body(schema drift 修复,见 #302)",
+                );
+                Some(s.to_owned())
+            } else {
                 tracing::warn!(
                     target = "adapters::apply_patch",
                     args_preview = %args_acc.chars().take(120).collect::<String>(),
                     "apply_patch args parsed as JSON but missing `input` string field; passing raw args to Codex CLI",
                 );
-                args_acc.to_owned()
+                None
             }
-        },
+        }
         Err(err) => {
-            if trimmed.starts_with("*** Begin Patch") {
+            if trimmed.contains("*** Begin Patch") {
                 tracing::debug!(
                     target = "adapters::apply_patch",
                     "apply_patch args are bare V4A (no JSON wrapper); passthrough",
                 );
+                Some(args_acc.to_owned())
             } else {
                 tracing::warn!(
                     target = "adapters::apply_patch",
@@ -1576,10 +1588,71 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
                     args_preview = %args_acc.chars().take(120).collect::<String>(),
                     "apply_patch args failed JSON parse and don't look like bare V4A; falling back to raw passthrough — likely truncation or schema drift",
                 );
+                None
             }
-            args_acc.to_owned()
         }
+    };
+    match candidate {
+        Some(body) => repair_v4a_envelope(&body),
+        None => args_acc.to_owned(),
     }
+}
+
+/// `input` 缺失时尝试的常见别名 key(模型 schema drift)。仅当值是含
+/// `*** Begin Patch` 的字符串才回收,避免误取无关字段。
+const APPLY_PATCH_ALT_KEYS: &[&str] = &["patch", "diff", "apply_patch", "input_text", "content"];
+
+/// 一行是否为 V4A 的 Begin/End sentinel —— **仅认列 0、无前缀的整行**(容忍尾部空白)。
+///
+/// 刻意**不**剥前导空白 / `+`:V4A 控制行恒在列 0 且无前缀,而正文行恒有前缀
+/// (Add File `+`、context ` `、删除 `-`)。若把 `+*** End Patch` 也当 sentinel,
+/// 遇到「文件内容恰含一行 `*** End Patch` + 流被截断在真正结尾之前」时,会把这条
+/// **正文**行误当信封结尾、合成一个"完整"补丁 → Codex 静默执行被截断的 patch
+/// (破坏性降级)。故前缀行一律按正文处理,交给 raw passthrough 让 Codex `parse_patch`
+/// 暴露 incomplete。(见 #302 codex-connector P2;stray-`+` sentinel 的安全消歧留 MOC-57。)
+fn v4a_sentinel(line: &str) -> Option<&'static str> {
+    match line.trim_end() {
+        "*** Begin Patch" => Some("*** Begin Patch"),
+        "*** End Patch" => Some("*** End Patch"),
+        _ => None,
+    }
+}
+
+/// 非破坏性 V4A 信封修复(见 #302):丢掉首个 `*** Begin Patch` 之前、末个
+/// `*** End Patch` 之后的杂散行(markdown fence / 解释性散文 / 空行)。
+///
+/// **绝不改动 Begin..End 之间的 `+`/`-`/context 正文行。** sentinel 仅认列 0、
+/// 无前缀的整行(见 [`v4a_sentinel`]),故 `+`/空格前缀的正文行(哪怕内容恰为
+/// `*** End Patch`)绝不会被误当信封边界。找不到顺序正确的 `Begin..End` 时原样
+/// 返回,交给 Codex `parse_patch` 暴露真坏。
+fn repair_v4a_envelope(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let begin = lines
+        .iter()
+        .position(|l| v4a_sentinel(l) == Some("*** Begin Patch"));
+    let end = lines
+        .iter()
+        .rposition(|l| v4a_sentinel(l) == Some("*** End Patch"));
+    let (Some(b), Some(e)) = (begin, end) else {
+        return body.to_owned();
+    };
+    if b >= e {
+        return body.to_owned();
+    }
+    // 已良构(首行恰 Begin、末行恰 End、无前后杂散)→ 原样返回,保字节精确
+    // (happy path 不被规整,避免动 freeform 直透的常态输出)。
+    if b == 0
+        && e == lines.len() - 1
+        && lines[b] == "*** Begin Patch"
+        && lines[e] == "*** End Patch"
+    {
+        return body.to_owned();
+    }
+    let mut out = Vec::with_capacity(e - b + 1);
+    out.push("*** Begin Patch".to_owned());
+    out.extend(lines[b + 1..e].iter().map(|l| (*l).to_owned()));
+    out.push("*** End Patch".to_owned());
+    out.join("\n")
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
@@ -3041,6 +3114,74 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         );
         // 空字符串:返回空
         assert_eq!(extract_apply_patch_input(""), "");
+    }
+
+    #[test]
+    fn extract_apply_patch_alt_key_patch_recovered() {
+        // 真机实测 schema drift:模型用 "patch" 而非 "input"(#302)
+        let args = r#"{"patch": "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch"}"#;
+        assert_eq!(
+            extract_apply_patch_input(args),
+            "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn extract_apply_patch_markdown_fence_stripped() {
+        let args = "```diff\n*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n```";
+        assert_eq!(
+            extract_apply_patch_input(args),
+            "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn extract_apply_patch_plus_prefixed_end_not_synthesized() {
+        // 安全性(#302 codex-connector P2):`+*** End Patch` 可能是被截断的正文行,
+        // 不得当作信封结尾合成"完整"补丁。无列 0 裸 End → 原样透传,让 Codex 暴露 incomplete。
+        let body = "*** Begin Patch\n*** Add File: a.txt\n+x\n+*** End Patch";
+        let args = serde_json::json!({ "input": body }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), body);
+    }
+
+    #[test]
+    fn extract_apply_patch_real_bare_end_after_plus_end_content_preserved() {
+        // 正文行恰为 `+*** End Patch`,其后有真正的列 0 裸 `*** End Patch`:
+        // 真 End 被识别,`+*** End Patch` 正文行完整保留(不被误当结尾截断)。
+        let body =
+            "*** Begin Patch\n*** Add File: doc.md\n+intro\n+*** End Patch\n+outro\n*** End Patch";
+        let args = serde_json::json!({ "input": body }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), body);
+    }
+
+    #[test]
+    fn extract_apply_patch_wellformed_preserved_byte_exact() {
+        // 良构 input 字节精确保留,不被规整
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch";
+        let args = serde_json::json!({ "input": patch }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), patch);
+        // 裸 V4A(含尾随 \n)亦原样透传
+        let bare = "*** Begin Patch\nfoo\n*** End Patch\n";
+        assert_eq!(extract_apply_patch_input(bare), bare);
+    }
+
+    #[test]
+    fn extract_apply_patch_content_line_with_end_patch_substring_not_truncated() {
+        // 正文行含 "*** End Patch" 子串(非整行 sentinel)不得被误判为结尾截断
+        let patch =
+            "*** Begin Patch\n*** Add File: doc.md\n+see *** End Patch marker\n+more\n*** End Patch";
+        let args = serde_json::json!({ "input": patch }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), patch);
+    }
+
+    #[test]
+    fn extract_apply_patch_truncated_no_end_raw_passthrough() {
+        // 截断(无 End sentinel)→ 不静默修补/截断正文,原样暴露给 parse_patch
+        let args = r#"{"input": "*** Begin Patch\n*** Add File: a.txt\n+partial"}"#;
+        assert_eq!(
+            extract_apply_patch_input(args),
+            "*** Begin Patch\n*** Add File: a.txt\n+partial"
+        );
     }
 
     #[test]
