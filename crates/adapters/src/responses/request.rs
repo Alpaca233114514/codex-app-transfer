@@ -163,10 +163,52 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
                 tools.iter().collect()
             };
 
-        let chat_tools: Vec<Value> = filtered_tools
-            .iter()
-            .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
-            .collect();
+       let chat_tools: Vec<Value> = filtered_tools
+           .iter()
+           .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
+           .collect();
+        // 若 apply_patch 已在工具列表中,注入 apply_patch_chunk 作为备选分块工具。
+        // 当模型发现单次 apply_patch 输出过长/被截断时,可改用 chunk 方式分片传输。
+        let mut chat_tools = chat_tools;
+        let has_apply_patch = chat_tools.iter().any(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                == Some(super::tools::APPLY_PATCH_TOOL_NAME)
+        });
+        if has_apply_patch {
+            let chunk_tool = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": super::tools::APPLY_PATCH_CHUNK_TOOL_NAME,
+                    "description": super::tools::APPLY_PATCH_CHUNK_TOOL_DESCRIPTION_FOR_CHAT,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "chunk_id": {
+                                "type": "string",
+                                "description": "Unique identifier shared by all chunks of the same patch"
+                            },
+                            "chunk_index": {
+                                "type": "integer",
+                                "description": "0-based index of this chunk"
+                            },
+                            "total_chunks": {
+                                "type": "integer",
+                                "description": "Total number of chunks in this patch"
+                            },
+                            "input": {
+                                "type": "string",
+                                "description": super::tools::APPLY_PATCH_CHUNK_INPUT_DESCRIPTION_FOR_CHAT
+                            }
+                        },
+                        "required": ["chunk_id", "chunk_index", "total_chunks", "input"]
+                    },
+                    "strict": false,
+                },
+            });
+            chat_tools.push(chunk_tool);
+        }
         if !chat_tools.is_empty() {
             // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
             // (`platform.kimi.ai/docs/guide/use-web-search`)明确写

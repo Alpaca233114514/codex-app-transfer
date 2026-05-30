@@ -166,8 +166,28 @@ pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "operate on a totally empty file; lone `+` without `-` appends instead of replacing. ",
     "If Update fails repeatedly, fall back to Delete File + Add File in one patch. ",
     "**`*** Begin Patch` MUST be the literal first line of `input`** (no preamble). ",
-    "**`*** Update File: <old>` + `*** Move to: <new>` requires ≥1 hunk** — for pure rename use `*** Delete File:` + `*** Add File:` instead."
+   "**`*** Update File: <old>` + `*** Move to: <new>` requires ≥1 hunk** — for pure rename use `*** Delete File:` + `*** Add File:` instead."
 );
+
+/// Chat-path tool name for chunked apply_patch. When a single apply_patch call
+/// is too large for the model to output in one JSON-escaped string (common on
+/// chat-completions path without lark grammar), the model can split the V4A
+/// patch into multiple chunks using this tool.
+pub(crate) const APPLY_PATCH_CHUNK_TOOL_NAME: &str = "apply_patch_chunk";
+
+/// Description for apply_patch_chunk — tells the model how to split large patches.
+pub(crate) const APPLY_PATCH_CHUNK_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
+    "Split a large V4A patch into chunks when the full patch is too long for a single ",
+    "apply_patch call. Each chunk carries the same `chunk_id` and sequential `chunk_index` ",
+    "(0-based). The adapter assembles all chunks before executing. ",
+    "Use this ONLY when apply_patch fails with a truncation error. ",
+    "Parameters: `chunk_id` (unique ID shared across chunks), ",
+    "`chunk_index` (0-based), `total_chunks` (total count), ",
+    "`input` (V4A fragment — concatenated in order to form the full patch)."
+);
+
+pub(crate) const APPLY_PATCH_CHUNK_INPUT_DESCRIPTION_FOR_CHAT: &str =
+    "A fragment of a V4A patch. Chunks are concatenated in chunk_index order to reconstruct the full patch.";
 
 /// Responses tool 定义 → Chat tool 定义.
 /// 把单个 Responses API tool 转成零或多个 Chat Completions tool。
@@ -242,10 +262,18 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME {
+            let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME || name == APPLY_PATCH_CHUNK_TOOL_NAME {
                 (
+                if name == APPLY_PATCH_TOOL_NAME {
                     APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT.to_owned(),
+                } else {
+                    APPLY_PATCH_CHUNK_TOOL_DESCRIPTION_FOR_CHAT.to_owned(),
+                },
+                if name == APPLY_PATCH_TOOL_NAME {
                     APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT.to_owned(),
+                } else {
+                    APPLY_PATCH_CHUNK_INPUT_DESCRIPTION_FOR_CHAT.to_owned(),
+                },
                 )
             } else {
                 (
