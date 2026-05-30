@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 
 use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
+use crate::responses::request::tools::APPLY_PATCH_TOOL_NAME;
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -79,6 +80,36 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn extract_apply_patch_input_from_gemini_args(args: &Value) -> String {
+    if let Some(s) = args.as_str() {
+        return s.to_owned();
+    }
+    let Some(obj) = args.as_object() else {
+        return String::new();
+    };
+    for key in ["input", "patch", "diff"] {
+        if let Some(s) = obj.get(key).and_then(Value::as_str) {
+            return s.to_owned();
+        }
+    }
+    String::new()
+}
+
+fn describe_args_shape(args: &Value) -> &'static str {
+    match args {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(obj) if obj.is_empty() => "object_empty",
+        Value::Object(obj) if obj.contains_key("input") => "object_with_input",
+        Value::Object(obj) if obj.contains_key("patch") => "object_with_patch",
+        Value::Object(obj) if obj.contains_key("diff") => "object_with_diff",
+        Value::Object(_) => "object_other",
+    }
 }
 
 /// 找 SSE event 边界。SSE spec 允许 `\n\n` 或 `\r\n\r\n` 分隔,Google `alt=sse`
@@ -143,6 +174,15 @@ struct ClosedFunctionCall {
     namespace: Option<String>,
 }
 
+struct ClosedCustomToolCall {
+    item_id: String,
+    output_index: u32,
+    call_id: String,
+    name: String,
+    input: String,
+    status: &'static str,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 主转换器
 // ═══════════════════════════════════════════════════════════════════════════
@@ -175,6 +215,8 @@ pub struct GeminiToResponsesConverter {
     open_reasoning: Option<OpenReasoning>,
     /// 已 close 的 function_call(完整 envelope output[] 用)
     closed_function_calls: Vec<ClosedFunctionCall>,
+    /// 已 close 的 custom_tool_call(apply_patch freeform 等)。
+    closed_custom_tool_calls: Vec<ClosedCustomToolCall>,
     /// 已 close 的 message items(H3 修复:Gemini 多轮 text→fc→text 序列会让
     /// 同一 stream 产生多个 message,旧实现 Option<Value> 会让后者覆盖前者,
     /// 导致 envelope output[] 跟客户端实际 stream 收到的事件 output_index 不匹配)。
@@ -256,6 +298,7 @@ impl GeminiToResponsesConverter {
             open_message: None,
             open_reasoning: None,
             closed_function_calls: Vec::new(),
+            closed_custom_tool_calls: Vec::new(),
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
             closed_other_items: Vec::new(),
@@ -501,6 +544,34 @@ impl GeminiToResponsesConverter {
                         .get("arguments")
                         .cloned()
                         .unwrap_or(Value::String("{}".into()));
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                Some("custom_tool_call") => {
+                    // Session cache 仍是 chat-shape history；custom/freeform 工具在
+                    // chat 侧用 function call + JSON arguments 表示。这里把
+                    // apply_patch 的裸 input 重新包装成 {"input": "..."}，供下轮
+                    // Gemini request path 还原 functionCall history。
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let name = item
+                        .get("name")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
+                    let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                    let arguments =
+                        serde_json::to_string(&json!({ "input": input })).unwrap_or_else(|_| {
+                            "{\"input\":\"\"}".to_owned()
+                        });
                     tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -908,6 +979,19 @@ impl GeminiToResponsesConverter {
         all_items.extend(self.closed_messages.drain(..));
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
+        for custom in self.closed_custom_tool_calls.drain(..) {
+            all_items.push((
+                custom.output_index,
+                json!({
+                    "type": "custom_tool_call",
+                    "id": custom.item_id,
+                    "call_id": custom.call_id,
+                    "name": custom.name,
+                    "input": custom.input,
+                    "status": custom.status,
+                }),
+            ));
+        }
         for fc in self.closed_function_calls.drain(..) {
             let mut item = json!({
                 "type": "function_call",
@@ -1272,6 +1356,12 @@ impl GeminiToResponsesConverter {
         };
         let output_index = self.next_output_index;
         self.next_output_index += 1;
+
+        if name == APPLY_PATCH_TOOL_NAME {
+            self.emit_apply_patch_custom_tool_call(out, item_id, call_id, output_index, args);
+            return;
+        }
+
         // OpenAI function_call.arguments 是 JSON 字符串,Gemini 是结构化对象 → 序列化
         // (LOW from sanity check):跟 emit_event 的 C2 fix 一致,失败时至少 log。
         // 实际 serde_json::to_string(&Value) 几乎不可能失败(只有 NaN/Infinity 等
@@ -1372,6 +1462,127 @@ impl GeminiToResponsesConverter {
             arguments_json_str: args_json_str,
             namespace: namespace_for,
         });
+    }
+
+    fn emit_apply_patch_custom_tool_call(
+        &mut self,
+        out: &mut Vec<u8>,
+        item_id: String,
+        call_id: String,
+        output_index: u32,
+        args: &Value,
+    ) {
+        let input = extract_apply_patch_input_from_gemini_args(args);
+        let model = self.model_for_diagnostics();
+        let args_shape = describe_args_shape(args);
+        if input.is_empty() || !input.contains("*** Begin Patch") {
+            tracing::warn!(
+                target = "adapters::apply_patch",
+                tool_name = APPLY_PATCH_TOOL_NAME,
+                call_id = %call_id,
+                model = %model,
+                args_shape = %args_shape,
+                input_len = input.len(),
+                input_preview = %input.chars().take(120).collect::<String>(),
+                "Gemini apply_patch functionCall did not contain a usable V4A patch input; emitting custom_tool_call for diagnostics but Codex may abort",
+            );
+        }
+
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": APPLY_PATCH_TOOL_NAME,
+                    "input": "",
+                    "status": "in_progress",
+                },
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.custom_tool_call_input.delta",
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "delta": input,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.custom_tool_call_input.done",
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "input": input,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": APPLY_PATCH_TOOL_NAME,
+                    "input": input,
+                    "status": "completed",
+                },
+            }),
+        );
+
+        let arguments = serde_json::to_string(&json!({ "input": input })).unwrap_or_else(|e| {
+            tracing::error!(
+                target = "adapters::apply_patch",
+                error = %e,
+                call_id = %call_id,
+                "BUG: failed to serialize apply_patch input for ToolCallCache; falling back to empty input",
+            );
+            "{\"input\":\"\"}".to_owned()
+        });
+        crate::responses::global_tool_call_cache().save(
+            &call_id,
+            crate::responses::ToolCallEntry {
+                name: APPLY_PATCH_TOOL_NAME.to_owned(),
+                arguments,
+            },
+        );
+        self.closed_custom_tool_calls.push(ClosedCustomToolCall {
+            item_id,
+            output_index,
+            call_id,
+            name: APPLY_PATCH_TOOL_NAME.to_owned(),
+            input,
+            status: "completed",
+        });
+    }
+
+    fn model_for_diagnostics(&self) -> String {
+        if !self.model.is_empty() {
+            return self.model.clone();
+        }
+        self.original_request
+            .as_ref()
+            .and_then(|r| r.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned()
     }
 
     // ───── inline_data / file_data 输出 (P0-E:模型多模态输出) ─────
@@ -2525,6 +2736,122 @@ mod tests {
             added.1["item"].get("namespace").is_none(),
             "顶级 function 不该带 namespace 字段,实际 {:?}",
             added.1["item"].get("namespace")
+        );
+    }
+
+    #[test]
+    fn apply_patch_function_call_emits_custom_tool_call_wire() {
+        let original_request = json!({"model": "gemini-3-flash"});
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.md\n+hi\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events_raw = drive_to_events(&mut conv, &[chunk]);
+        let events: Vec<(String, Value)> = events_raw.iter().map(|e| parse_event(e)).collect();
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_item.added")
+            .expect("output_item.added emitted");
+        assert_eq!(added.1["item"]["type"], "custom_tool_call");
+        assert_eq!(added.1["item"]["name"], "apply_patch");
+        let input_delta = events
+            .iter()
+            .find(|(n, _)| n == "response.custom_tool_call_input.delta")
+            .expect("custom_tool_call_input.delta emitted");
+        let expected = "*** Begin Patch\n*** Add File: a.md\n+hi\n*** End Patch\n";
+        assert_eq!(input_delta.1["delta"], expected);
+        assert!(
+            events
+                .iter()
+                .any(|(n, _)| n == "response.custom_tool_call_input.done"),
+            "custom_tool_call_input.done emitted"
+        );
+        let done = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done"
+                    && p["item"].get("type").and_then(|v| v.as_str())
+                        == Some("custom_tool_call")
+            })
+            .expect("custom output_item.done emitted");
+        assert_eq!(done.1["item"]["input"], expected);
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        let final_item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call"))
+            .expect("custom_tool_call in completed output");
+        assert_eq!(final_item["input"], expected);
+    }
+
+    #[test]
+    fn normal_function_call_still_emits_function_call_arguments() {
+        let mut conv = GeminiToResponsesConverter::new(Some(json!({"model": "gemini-3-flash"})), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"exec_command","args":{"cmd":"echo hi"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events_raw = drive_to_events(&mut conv, &[chunk]);
+        let events: Vec<(String, Value)> = events_raw.iter().map(|e| parse_event(e)).collect();
+        assert!(
+            events
+                .iter()
+                .any(|(n, _)| n == "response.function_call_arguments.delta"),
+            "normal function_call_arguments.delta emitted"
+        );
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_item.added")
+            .expect("output_item.added emitted");
+        assert_eq!(added.1["item"]["type"], "function_call");
+        assert_eq!(added.1["item"]["name"], "exec_command");
+    }
+
+    #[test]
+    fn apply_patch_empty_args_warns_but_does_not_panic() {
+        let mut conv = GeminiToResponsesConverter::new(Some(json!({"model": "gemini-3-flash"})), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events_raw = drive_to_events(&mut conv, &[chunk]);
+        let events: Vec<(String, Value)> = events_raw.iter().map(|e| parse_event(e)).collect();
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_item.added")
+            .expect("output_item.added emitted");
+        assert_eq!(added.1["item"]["type"], "custom_tool_call");
+        let delta = events
+            .iter()
+            .find(|(n, _)| n == "response.custom_tool_call_input.delta")
+            .expect("custom_tool_call_input.delta emitted");
+        assert_eq!(delta.1["delta"], "");
+        assert!(
+            !events
+                .iter()
+                .any(|(n, _)| n == "response.function_call_arguments.delta"),
+            "empty apply_patch must not fall back to normal function_call wire"
+        );
+    }
+
+    #[test]
+    fn apply_patch_accepts_raw_string_or_patch_alias() {
+        let raw = "*** Begin Patch\n*** Add File: raw.md\n+raw\n*** End Patch\n";
+        assert_eq!(
+            extract_apply_patch_input_from_gemini_args(&Value::String(raw.to_owned())),
+            raw
+        );
+        let patch = "*** Begin Patch\n*** Add File: p.md\n+p\n*** End Patch\n";
+        assert_eq!(
+            extract_apply_patch_input_from_gemini_args(&json!({"patch": patch})),
+            patch
+        );
+        let diff = "*** Begin Patch\n*** Add File: d.md\n+d\n*** End Patch\n";
+        assert_eq!(
+            extract_apply_patch_input_from_gemini_args(&json!({"diff": diff})),
+            diff
         );
     }
 }

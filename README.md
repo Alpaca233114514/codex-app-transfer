@@ -60,7 +60,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - 管理多套供应商,按 OpenAI 模型名(`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`)映射到供应商真实模型 ID
 - 把 Codex APP 的 Responses API 流式 / 非流式请求转换为上游协议:Chat Completions、Gemini Native(`:streamGenerateContent`)、Gemini CLI OAuth(Cloud Code Assist)、Anthropic Messages(`/v1/messages`)、Grok Web(`/rest/app-chat/conversations/new`)、Responses 透传等
 - 多轮工具对话上下文 + `previous_response_id` 历史回放 + autocompact 展开 + thinking / reasoning_content 注入全部对齐 OpenAI Responses API 协议
-- Codex APP 的 freeform `apply_patch` 工具(编辑文件 +/- diff UI)在 DeepSeek / Kimi / MiMo 等 chat-completions provider 上正常工作:adapter 双向桥接 Responses `custom_tool_call` ↔ chat `function_call` 形态,模型按 V4A 格式生成 patch,Codex APP 渲染为 diff(issue #235)
+- Codex APP 的 freeform `apply_patch` 工具(编辑文件 +/- diff UI)在 DeepSeek / Kimi / MiMo 等 chat-completions provider 上正常工作:adapter 双向桥接 Responses `custom_tool_call` ↔ chat `function_call` 形态,模型按 V4A 格式生成 patch,Codex APP 渲染为 diff(issue #235);Gemini Native / Gemini CLI OAuth / Antigravity 路径也通过 `input` 参数桥接 freeform patch,并还原为 Codex custom tool call
 - 会话历史**两层持久化**:L1 内存 LRU + L2 sqlite 30 天 TTL(`~/.codex-app-transfer/sessions.db`),`.app` 重启不丢历史
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原
 - **Codex 文档管理**(Sidebar → Codex):

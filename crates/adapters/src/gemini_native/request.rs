@@ -33,6 +33,10 @@ use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
 use crate::core::input::response_id_for_session;
+use crate::responses::request::tools::{
+    APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT, APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT,
+    APPLY_PATCH_TOOL_NAME,
+};
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -667,17 +671,46 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 out.push(Value::Object(m));
             }
             "custom" => {
-                // Codex.app 私有 custom tool — 当 function declaration 处理
+                // Codex.app 私有 custom/freeform tool — Gemini 只认 functionDeclaration,
+                // 所以必须像 chat 路径一样降级为单 `input: string` 参数。不能只
+                // 保留 name/description:Gemini 看不到参数时会稳定返回 args={}
+                // → Codex apply_patch 收到空 input 后 aborted(MOC-75)。
                 let mut func = Map::new();
-                if let Some(n) = obj.get("name") {
-                    func.insert("name".into(), n.clone());
-                }
-                if let Some(d) = obj.get("description") {
-                    func.insert("description".into(), d.clone());
-                }
-                if let Some(p) = obj.get("parameters") {
-                    func.insert("parameters".into(), p.clone());
-                }
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let original_description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME {
+                    (
+                        APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT,
+                        APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT,
+                    )
+                } else {
+                    (
+                        original_description,
+                        "Free-form input passed verbatim to the tool.",
+                    )
+                };
+                func.insert("name".into(), Value::String(name.to_owned()));
+                func.insert(
+                    "description".into(),
+                    Value::String(tool_description.to_owned()),
+                );
+                func.insert(
+                    "parameters".into(),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": input_description,
+                            }
+                        },
+                        "required": ["input"],
+                        "strict": false,
+                    }),
+                );
                 let mut wrapper = Map::new();
                 wrapper.insert("type".into(), Value::String("function".into()));
                 wrapper.insert("function".into(), Value::Object(func));
@@ -2992,5 +3025,85 @@ mod tests {
             .find_map(|t| t.function_declarations.clone())
             .unwrap();
         assert_eq!(decls[0].name, "calc");
+    }
+
+    #[test]
+    fn responses_custom_apply_patch_gets_input_schema_for_gemini() {
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"edit"}],
+            "tools":[{"type":"custom","name":"apply_patch","description":"Use raw patch"}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let decls = req
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.iter().find_map(|t| t.function_declarations.as_ref()))
+            .expect("functionDeclarations emitted");
+        let apply_patch = decls
+            .iter()
+            .find(|d| d.name == "apply_patch")
+            .expect("apply_patch declaration present");
+        let desc = apply_patch.description.as_deref().unwrap_or("");
+        assert!(desc.contains("*** Begin Patch"));
+        assert!(desc.contains("input"));
+        let params = apply_patch.parameters.as_ref().expect("parameters present");
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["input"]["type"], "string");
+        assert_eq!(params["required"], serde_json::json!(["input"]));
+    }
+
+    #[test]
+    fn responses_custom_non_apply_patch_gets_generic_input_schema() {
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"x"}],
+            "tools":[{"type":"custom","name":"freeform_echo","description":"Echo freeform text"}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let decls = req
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.iter().find_map(|t| t.function_declarations.as_ref()))
+            .expect("functionDeclarations emitted");
+        let custom = decls
+            .iter()
+            .find(|d| d.name == "freeform_echo")
+            .expect("custom declaration present");
+        assert_eq!(custom.description.as_deref(), Some("Echo freeform text"));
+        let params = custom.parameters.as_ref().expect("parameters present");
+        assert_eq!(params["properties"]["input"]["type"], "string");
+        assert_eq!(params["required"], serde_json::json!(["input"]));
+    }
+
+    #[test]
+    fn namespace_inner_custom_apply_patch_keeps_input_schema() {
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"edit"}],
+            "tools":[{
+                "type":"namespace",
+                "name":"mcp__codex__",
+                "description":"Codex tools",
+                "tools":[{"type":"custom","name":"apply_patch","description":"raw patch"}]
+            }]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let decls = req
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.iter().find_map(|t| t.function_declarations.as_ref()))
+            .expect("functionDeclarations emitted");
+        let apply_patch = decls
+            .iter()
+            .find(|d| d.name == "apply_patch")
+            .expect("apply_patch declaration present");
+        let desc = apply_patch.description.as_deref().unwrap_or("");
+        assert!(desc.contains("[MCP server `mcp__codex__`: Codex tools]"));
+        assert!(desc.contains("*** Begin Patch"));
+        assert_eq!(
+            apply_patch.parameters.as_ref().unwrap()["properties"]["input"]["type"],
+            "string"
+        );
     }
 }
