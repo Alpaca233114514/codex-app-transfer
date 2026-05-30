@@ -877,13 +877,26 @@ impl GeminiToResponsesConverter {
     /// envelope.error 用 OpenAI Responses API 的 `{code, message}` 形状,Codex.app
     /// 客户端能正确识别 + 显示。`type` 字段额外塞 upstream HTTP status 方便诊断。
     ///
+    /// **`codex_code` 必须是 Codex 客户端 `response.failed` handler 认识的 retry-control
+    /// code**(见 [`codex_retry_code`] 的文档):Codex 只按 `error.code` 字符串决定是否
+    /// 重试,不认识的 code 一律落 `Retryable` → `CodexErr::Stream`(`is_retryable()=true`)
+    /// → 卡死重发到 max_retries(MOC-79 实证)。`upstream_kind` 是我们内部的语义分类
+    /// (`bad_request` / `auth_error` / …),作为 `error.upstream_error_kind` 诊断字段保留
+    /// (Codex `Error` struct 无 `deny_unknown_fields`,该字段被安全忽略)。
+    ///
     /// **WARNING — 仅 pre-stream 调用**:本方法无脑标 `completed_emitted = true`,**不会**
     /// flush 任何 pending output_item.done / content_part.done。如果上游已 emit 过部分
     /// output_*.delta 后中途调 emit_failure,客户端会看到孤立的 delta + failed,行为
     /// 未定义。当前唯一调用点是 `convert_gemini_error_to_responses_failure_stream`
     /// (fresh converter,4xx/5xx 入口),mid-stream 失败请走 `final_finish_reason =
     /// FINISH_INTERRUPTED` 让 `finish()` emit incomplete envelope。
-    pub(super) fn emit_failure(&mut self, code: &str, message: &str, http_status: u16) -> Vec<u8> {
+    pub(super) fn emit_failure(
+        &mut self,
+        codex_code: &str,
+        upstream_kind: &str,
+        message: &str,
+        http_status: u16,
+    ) -> Vec<u8> {
         debug_assert!(
             !self.completed_emitted,
             "emit_failure called after terminal event — would skip pending item closures"
@@ -897,9 +910,10 @@ impl GeminiToResponsesConverter {
         envelope["usage"] = Value::Null;
         envelope["incomplete_details"] = Value::Null;
         envelope["error"] = json!({
-            "code": code,
+            "code": codex_code,
             "message": message,
             "type": format!("upstream_http_{http_status}"),
+            "upstream_error_kind": upstream_kind,
         });
         let payload = json!({"type": "response.failed", "response": envelope});
         emit_event(
@@ -1702,6 +1716,54 @@ const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// 给操作者足够诊断信息(stack trace / quota detail)又不至于撑爆 SSE event。
 const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
 
+/// 把内部语义 error 分类(`bad_request` / `auth_error` / …)映射成 **Codex 客户端
+/// `response.failed` handler 认识的 retry-control `error.code`**。
+///
+/// **为什么必须映射(MOC-79 根因)**:Codex(对照 openai/codex `codex-rs`,2026-05 HEAD;
+/// `codex-api/src/sse/responses.rs` 的 `response.failed` 分支)**只按 `error.code` 字符串**
+/// 决定如何处理失败:
+/// - `invalid_prompt`          → `ApiError::InvalidRequest` → `CodexErr::InvalidRequest`
+/// - `insufficient_quota`      → `ApiError::QuotaExceeded`
+/// - `context_length_exceeded` → `ApiError::ContextWindowExceeded`(触发 compact)
+/// - `server_is_overloaded` / `slow_down` → `ApiError::ServerOverloaded`
+/// - `cyber_policy` / `usage_not_included` → 对应致命态
+/// - **其它任何值 → `ApiError::Retryable` → `CodexErr::Stream`**
+///
+/// 而 Codex turn loop(`core/src/session/turn.rs`)是 `if !err.is_retryable() { return Err(err) }`,
+/// 其中 `CodexErr::Stream(..).is_retryable() == true`,上面那些命名态 `== false`。所以:
+/// **不认识的 `error.code` = 可重试 = Codex 反复重发同一请求到 max_retries**。MOC-79
+/// 实测 `gemini-3.1-pro-high` 400 INVALID_ARGUMENT 被 Codex 重发 12 次卡死,正是因为
+/// 旧实现 emit 的 `error.code = "bad_request"` 不在 Codex 白名单 → 落 Retryable。
+///
+/// **映射原则 —— 只有「无歧义永久性」错误才映射成非重试 code**:
+/// - retry 同一请求**必定**得到同样失败的(400 bad_request / 400 content_filter /
+///   401 auth / 403 permission)→ `invalid_prompt`(`InvalidRequest`,is_retryable=false),
+///   让 Codex surface 错误 + 停手,用户能看到原因并换模型(MOC-79 的目标)。
+/// - **其余分类一律保留原 code → 落 Codex `Retryable`**:瞬时错误(超时 / 限流 / 5xx /
+///   transport)退避重试可恢复;真不可恢复的(如日级配额)退避到 max_retries 后 surface,
+///   = pre-PR 行为,不误杀。**拿不准就别加白名单 —— 留 Retryable 比误判成非重试安全**。
+///
+/// 两次实证教训(chatgpt-codex-connector P2),都因把「半永久」错误当永久而误判:
+/// - 503 `service_unavailable` 是**瞬时过载**,若映射 `server_is_overloaded`
+///   (`ServerOverloaded`,is_retryable=false)会让本应重试的 503 立即断对话;
+/// - 429 `quota_exceeded` 在 Gemini 把 **per-minute 限流**和日级配额混在一起,若映射
+///   `insufficient_quota`(非重试)会让常见的 per-minute 限流立即失败。
+/// 两者都保留原 code 走 Retryable。
+///
+/// 原始语义分类仍由 `emit_failure` 写进 `error.upstream_error_kind` + operator-side
+/// `tracing` 日志保留,不丢诊断信息。
+fn codex_retry_code(upstream_kind: &str) -> &str {
+    match upstream_kind {
+        // 无歧义永久性(retry 同一请求必得同样失败)→ Codex 非重试 code,surface + 停
+        "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
+        // 其余(timeout / rate_limited / quota_exceeded / server_error / service_unavailable /
+        // upstream_error / upstream_transport_error)→ 保留原 code → Codex Retryable。
+        // **仅当确信是「无歧义永久性」分类时**才加到上面白名单;拿不准留这里(Retryable
+        // 比误杀安全,见上方两次 P2 教训)。
+        other => other,
+    }
+}
+
 /// 上游 4xx/5xx 错误 → Responses SSE failure 流。
 ///
 /// **不能直接透传 Gemini raw JSON 4xx body** — Codex.app 期待 SSE event 流,
@@ -1709,17 +1771,19 @@ const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
 /// 改成构造合规 Responses SSE:`response.created`(in_progress)→ `response.failed`
 /// 含 error code + message。客户端能识别 + 显示用户级错误。
 ///
-/// 错误分类(status code + Gemini `error.status` + message 关键词):
-/// - 401 / UNAUTHENTICATED → `auth_error`
-/// - 403 / PERMISSION_DENIED → `permission_denied`(API 未启用 / billing / region)
-/// - 408 / 504 → `timeout`(retry 可能有效)
-/// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded`(retry 短期内无效)
-/// - 429 其他 → `rate_limited`(指数退避 retry)
-/// - 400 + SAFETY/blockReason → `content_filter`
-/// - 400 其他 → `bad_request`
-/// - 503 → `service_unavailable`
-/// - 502 / 5xx 其他 → `server_error`
-/// - 其他 → `upstream_error`
+/// 错误分类(status code + Gemini `error.status` + message 关键词)→ 语义 kind,
+/// 再经 [`codex_retry_code`] 映射成 Codex 认识的 `error.code`(控制是否重试):
+/// - 401 / UNAUTHENTICATED → `auth_error` → `invalid_prompt`(永久,surface)
+/// - 403 / PERMISSION_DENIED → `permission_denied` → `invalid_prompt`(永久,surface)
+/// - 408 / 504 → `timeout` → 保留(瞬时,Codex 重试)
+/// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded` → 保留(瞬时:Gemini 429 混 per-minute
+///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`codex_retry_code`])
+/// - 429 其他 → `rate_limited` → 保留(瞬时,指数退避 retry)
+/// - 400 + SAFETY/blockReason → `content_filter` → `invalid_prompt`(永久,surface)
+/// - 400 其他 → `bad_request` → `invalid_prompt`(永久,surface;**MOC-79 卡死点**)
+/// - 503 → `service_unavailable` → 保留(瞬时过载,Codex 重试;**不**用 `server_is_overloaded`)
+/// - 502 / 5xx 其他 → `server_error` → 保留(瞬时,Codex 重试)
+/// - 其他 → `upstream_error` → 保留(瞬时)
 ///
 /// 防御性失败处理(本身**不能**埋新 silent failure):
 /// - upstream ByteStream Err mid-read → 把 transport error 拼进用户 message,降级
@@ -1926,7 +1990,10 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                 }
 
                 let mut conv = GeminiToResponsesConverter::new(orig, None);
-                let out = conv.emit_failure(code, &error_message, status_u16);
+                // `code` 是内部语义分类;真正写进 envelope.error.code 的是 Codex 认识的
+                // retry-control code(见 codex_retry_code)。语义 kind 保留在 upstream_error_kind。
+                let out =
+                    conv.emit_failure(codex_retry_code(code), code, &error_message, status_u16);
                 Some((Ok(Bytes::from(out)), (input, None, true)))
             },
         ),
@@ -2609,7 +2676,10 @@ mod tests {
         assert!(s.contains("event: response.created"));
         assert!(s.contains("event: response.in_progress"));
         assert!(s.contains("event: response.failed"));
+        // 429 quota 保留 quota_exceeded(瞬时/混 per-minute → Codex Retryable,不映射非重试)
         assert!(s.contains("\"code\":\"quota_exceeded\""));
+        assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
+        assert!(!s.contains("\"code\":\"insufficient_quota\""));
         assert!(s.contains("\"type\":\"upstream_http_429\""));
         assert!(s.contains("Quota exceeded"));
     }
@@ -2618,7 +2688,9 @@ mod tests {
     fn failure_stream_401_auth_error() {
         let body = r#"{"error":{"code":401,"message":"API key not valid. Please pass a valid API key.","status":"UNAUTHENTICATED"}}"#;
         let s = drive_failure_stream(401, body);
-        assert!(s.contains("\"code\":\"auth_error\""));
+        // 401 永久(同凭据 retry 无意义)→ Codex invalid_prompt(surface + 停)
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
+        assert!(s.contains("\"upstream_error_kind\":\"auth_error\""));
         assert!(s.contains("API key not valid"));
         assert!(s.contains("event: response.failed"));
     }
@@ -2650,8 +2722,10 @@ mod tests {
         // 等真 permission 错应保持 permission_denied 让用户检查 billing
         let body = r#"{"error":{"code":403,"message":"cloudaicompanionProject 'xxx-default-1234' is not authorized to access this resource.","status":"PERMISSION_DENIED"}}"#;
         let s = drive_failure_stream(403, body);
-        assert!(s.contains("\"code\":\"permission_denied\""));
-        assert!(!s.contains("\"code\":\"quota_exceeded\""));
+        // 分类(upstream_error_kind)仍是 permission_denied,不该误归 quota;Codex code 是 invalid_prompt
+        assert!(s.contains("\"upstream_error_kind\":\"permission_denied\""));
+        assert!(!s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
     }
 
     #[test]
@@ -2662,10 +2736,12 @@ mod tests {
         // 让 client UI 显示"次日重置"
         let body = r#"{"error":{"code":403,"message":"Quota exceeded for cloudaicompanionProject 'xxx-default-1234'.","status":"PERMISSION_DENIED"}}"#;
         let s = drive_failure_stream(403, body);
+        // 分类 quota_exceeded;保留原 code(走 Codex Retryable),不映射非重试 insufficient_quota
+        assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
         assert!(s.contains("\"code\":\"quota_exceeded\""));
         assert!(s.contains("Free-tier daily quota exhausted"));
         // 不应误归 permission_denied
-        assert!(!s.contains("\"code\":\"permission_denied\""));
+        assert!(!s.contains("\"upstream_error_kind\":\"permission_denied\""));
     }
 
     #[test]
@@ -2673,32 +2749,87 @@ mod tests {
         // 403 PERMISSION_DENIED 应区分于 401 auth_error(用户不会被误导去检查 API key)
         let body = r#"{"error":{"code":403,"message":"Generative Language API has not been used in project xxx before or it is disabled.","status":"PERMISSION_DENIED"}}"#;
         let s = drive_failure_stream(403, body);
-        assert!(s.contains("\"code\":\"permission_denied\""));
+        // 403 permission 永久 → Codex invalid_prompt;语义 kind 仍区分于 401(auth_error)
+        assert!(s.contains("\"upstream_error_kind\":\"permission_denied\""));
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
         assert!(s.contains("API not enabled, billing, or region restricted"));
         assert!(s.contains("\"type\":\"upstream_http_403\""));
     }
 
     #[test]
     fn failure_stream_403_unauthenticated_keeps_auth_error() {
-        // 403 但 status=UNAUTHENTICATED(罕见但 Gemini 偶尔这么返)→ auth_error
+        // 403 但 status=UNAUTHENTICATED(罕见但 Gemini 偶尔这么返)→ auth_error 分类
         let body = r#"{"error":{"code":403,"message":"Invalid auth credential.","status":"UNAUTHENTICATED"}}"#;
         let s = drive_failure_stream(403, body);
-        assert!(s.contains("\"code\":\"auth_error\""));
+        assert!(s.contains("\"upstream_error_kind\":\"auth_error\""));
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
     }
 
     #[test]
     fn failure_stream_400_safety_block_emits_content_filter() {
-        // 400 + safety 关键词 → content_filter,跟普通 schema 错区分
+        // 400 + safety 关键词 → content_filter 分类,跟普通 schema 错区分;Codex code = invalid_prompt
         let body = r#"{"error":{"code":400,"message":"Request contains content blocked by safety filter (HARM_CATEGORY_DANGEROUS).","status":"INVALID_ARGUMENT"}}"#;
         let s = drive_failure_stream(400, body);
-        assert!(s.contains("\"code\":\"content_filter\""));
+        assert!(s.contains("\"upstream_error_kind\":\"content_filter\""));
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
     }
 
     #[test]
     fn failure_stream_400_schema_error_stays_bad_request() {
         let body = r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"xx\".","status":"INVALID_ARGUMENT"}}"#;
         let s = drive_failure_stream(400, body);
-        assert!(s.contains("\"code\":\"bad_request\""));
+        assert!(s.contains("\"upstream_error_kind\":\"bad_request\""));
+        assert!(s.contains("\"code\":\"invalid_prompt\""));
+    }
+
+    #[test]
+    fn failure_stream_400_invalid_argument_is_non_retryable_for_codex_moc79() {
+        // MOC-79 回归守卫:gemini-3.1-pro-high 上游返 400 INVALID_ARGUMENT(forward-trace
+        // seq 239-251 实证的精确 body)。旧实现 emit error.code="bad_request",不在 Codex
+        // response.failed handler 白名单 → 落 ApiError::Retryable → CodexErr::Stream
+        // (is_retryable=true)→ Codex 重发同一请求 12 次卡死。
+        //
+        // 修复后必须 emit error.code="invalid_prompt" → Codex ApiError::InvalidRequest →
+        // CodexErr::InvalidRequest(is_retryable=false)→ surface 给用户 + 停手 + 能换模型。
+        let body = r#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}"#;
+        let s = drive_failure_stream(400, body);
+        assert!(s.contains("event: response.failed"));
+        // 关键断言:Codex 认作非重试的 InvalidRequest(否则又会卡死重试)
+        assert!(
+            s.contains("\"code\":\"invalid_prompt\""),
+            "400 INVALID_ARGUMENT 必须 emit Codex 白名单里的非重试 code,否则 Codex 卡死重试;实际:{s}"
+        );
+        // **绝不能**再 emit 旧的 bad_request 当 error.code(那会落 Retryable)
+        assert!(!s.contains("\"code\":\"bad_request\""));
+        // 原始语义分类 + 上游 message 仍保留供诊断 / 用户阅读
+        assert!(s.contains("\"upstream_error_kind\":\"bad_request\""));
+        assert!(s.contains("Request contains an invalid argument"));
+        assert!(s.contains("\"type\":\"upstream_http_400\""));
+    }
+
+    #[test]
+    fn codex_retry_code_maps_permanent_to_whitelist_keeps_transient() {
+        // 永久错误 → Codex 白名单(非重试):用户看到错误能换模型
+        assert_eq!(codex_retry_code("bad_request"), "invalid_prompt");
+        assert_eq!(codex_retry_code("content_filter"), "invalid_prompt");
+        assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
+        assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
+        // 其余一律保留原 code → Codex Retryable(该重试 / 拿不准别误杀,别动)
+        // quota_exceeded:Gemini 429 混 per-minute 限流,不映射非重试 insufficient_quota
+        assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
+        // service_unavailable:瞬时过载,不映射非重试 server_is_overloaded
+        assert_eq!(
+            codex_retry_code("service_unavailable"),
+            "service_unavailable"
+        );
+        assert_eq!(codex_retry_code("timeout"), "timeout");
+        assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
+        assert_eq!(codex_retry_code("server_error"), "server_error");
+        assert_eq!(codex_retry_code("upstream_error"), "upstream_error");
+        assert_eq!(
+            codex_retry_code("upstream_transport_error"),
+            "upstream_transport_error"
+        );
     }
 
     #[test]
@@ -2713,7 +2844,12 @@ mod tests {
     #[test]
     fn failure_stream_503_service_unavailable_distinct_from_500() {
         let s = drive_failure_stream(503, r#"{"error":{"message":"overloaded"}}"#);
+        // 503 是瞬时 → 保留 service_unavailable(落 Codex Retryable,该重试);
+        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 codex_retry_code)
         assert!(s.contains("\"code\":\"service_unavailable\""));
+        assert!(!s.contains("\"code\":\"server_is_overloaded\""));
+        assert!(s.contains("\"upstream_error_kind\":\"service_unavailable\""));
+        // 500 也是瞬时 → 保留 server_error(落 Codex Retryable,该重试)
         let s = drive_failure_stream(500, r#"{"error":{"message":"internal"}}"#);
         assert!(s.contains("\"code\":\"server_error\""));
     }
@@ -2725,6 +2861,7 @@ mod tests {
         let s = drive_failure_stream(429, body);
         assert!(s.contains("array-form quota exceeded"));
         assert!(s.contains("\"code\":\"quota_exceeded\""));
+        assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
     }
 
     #[test]
