@@ -1775,7 +1775,7 @@ fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value
 /// 取到候选后过 [`repair_v4a_envelope`] 规整信封(剥 markdown fence / Begin 前
 /// End 后的杂散行)。取不到候选(截断 / 非 V4A 垃圾)则**原样透传**,交给 Codex
 /// CLI `parse_patch` 暴露真坏 —— 绝不静默吞、不截断正文。不做 V4A 语法校验。
-fn extract_apply_patch_input(args_acc: &str) -> String {
+pub(crate) fn extract_apply_patch_input(args_acc: &str) -> String {
     let trimmed = args_acc.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -1893,9 +1893,9 @@ fn repair_v4a_envelope(body: &str) -> String {
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514)。
 #[derive(Debug, Clone)]
-struct V4aError {
-    line: usize,
-    message: String,
+pub(crate) struct V4aError {
+    pub(crate) line: usize,
+    pub(crate) message: String,
 }
 
 /// 检测 chat function args(JSON 形态)是否被流式截断:未闭合字符串(奇数个
@@ -1980,7 +1980,7 @@ fn detect_v4a_truncation(v4a: &str) -> Option<String> {
 /// 行被 trim 后误当 operation header。
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514);bug 修复见 PR #322 review。
-fn validate_v4a_syntax(input: &str) -> Result<(), V4aError> {
+pub(crate) fn validate_v4a_syntax(input: &str) -> Result<(), V4aError> {
     let lines: Vec<&str> = input.lines().collect();
     if lines.is_empty() {
         return Err(V4aError {

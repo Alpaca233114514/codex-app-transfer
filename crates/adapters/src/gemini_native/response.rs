@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 
 use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
+use crate::responses::request::tools::APPLY_PATCH_TOOL_NAME;
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -141,6 +142,15 @@ struct ClosedFunctionCall {
     /// `Some("mcp__<server>__")` 当 function.name 来自 namespace 包装。
     /// envelope output[] emit 时回灌成 item.namespace 字段。
     namespace: Option<String>,
+    /// [MOC-75] `Some(patch)` 当 name==apply_patch:envelope output[] 要 emit 成
+    /// `custom_tool_call` item(`input`=patch),而非 function_call —— Codex CLI
+    /// router 对 apply_patch 硬要求 `ToolPayload::Custom{input}`,收 Function
+    /// payload 直接 abort(见 responses/converter.rs::close_tool_call 注释)。
+    apply_patch_input: Option<String>,
+    /// [MOC-75] V4A 后验校验失败(完整但畸形的 patch)→ envelope custom_tool_call 也
+    /// emit `status="incomplete"`,让严格读 envelope 终态的客户端不把畸形 patch 当完整
+    /// 执行(破坏性半应用防护,对齐 #322)。仅 apply_patch 分支可能置 true。
+    apply_patch_incomplete: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -510,6 +520,35 @@ impl GeminiToResponsesConverter {
                         }
                     }));
                 }
+                // [MOC-75] apply_patch(及其它 lowered custom freeform 工具)的 envelope item
+                // 是 `custom_tool_call`(裸 `input`=patch)。session 历史用 chat-format,必须
+                // 重建成 function-type tool_call、arguments=`{"input":<patch>}` —— 与请求侧
+                // `responses/request.rs` 的 `custom_tool_call` 回放 arm 形态一致。否则下一轮
+                // `previous_response_id` 续话时 assistant 历史缺这条 apply_patch call,新进来的
+                // `custom_tool_call_output`(functionResponse)无匹配 functionCall → Gemini
+                // BadRequest / 多轮 apply_patch 断(devin BUG 反馈,response.rs:953 缓存路径)。
+                Some("custom_tool_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let name = item
+                        .get("name")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("apply_patch".into()));
+                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = serde_json::to_string(&json!({ "input": input }))
+                        .unwrap_or_else(|_| "{}".to_owned());
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
                 _ => {}
             }
         }
@@ -649,6 +688,18 @@ impl GeminiToResponsesConverter {
 
         // 处理候选(MVP 只关心 candidates[0],n>1 的多 candidate 留 follow-up)
         for candidate in &gemini.candidates {
+            // [MOC-75] **先记 finishReason,再处理 parts** —— 让下面 part 循环里的
+            // `emit_function_call`(apply_patch 分支)能看到本 chunk 的 finishReason
+            // (MAX_TOKENS / SAFETY 等响应级截断信号),据此 gate apply_patch
+            // status=incomplete(防 Codex 应用被 token 上限截断的 patch;chat 路径靠
+            // interrupted 做同样防护)。**粘性保护**:INTERRUPTED(cap-trip / upstream-Err
+            // 标记的已宣告中断)不被后续合法 chunk 的 finishReason="STOP" 覆盖回 completed,
+            // 否则"宣告 incomplete 后又静默 recover"是 silent truncation 的孪生 bug。
+            if let Some(fr) = &candidate.finish_reason {
+                if self.final_finish_reason.as_deref() != Some(FINISH_INTERRUPTED) {
+                    self.final_finish_reason = Some(fr.clone());
+                }
+            }
             if let Some(content) = &candidate.content {
                 for part in &content.parts {
                     // text part
@@ -756,16 +807,8 @@ impl GeminiToResponsesConverter {
             if let Some(tc) = candidate.token_count {
                 self.accumulated_token_counts.push(tc);
             }
-            // finishReason 累积到末态(末 chunk emit completed 时用)
-            // **粘性保护**(sanity check 报告):INTERRUPTED 是 C3b/C4 cap-trip /
-            // upstream-Err 路径标记的"已宣告中断",不能被后续合法 chunk 的
-            // finishReason="STOP" 覆盖回 completed —— 那会让"宣告 incomplete 后又
-            // 静默 recover"成 silent truncation 的孪生 bug。
-            if let Some(fr) = &candidate.finish_reason {
-                if self.final_finish_reason.as_deref() != Some(FINISH_INTERRUPTED) {
-                    self.final_finish_reason = Some(fr.clone());
-                }
-            }
+            // finishReason 已在本 candidate 循环开头记录(移到 parts 之前,见上 [MOC-75]),
+            // 让 emit_function_call(apply_patch)能据本 chunk finishReason gate incomplete。
         }
         // P0-F:promptFeedback.blockReason — Gemini 拒 user prompt(safety 拦截)→
         // 设 prompt_block_reason,emit_completed 转 status=incomplete + reason=
@@ -909,15 +952,29 @@ impl GeminiToResponsesConverter {
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
         for fc in self.closed_function_calls.drain(..) {
-            let mut item = json!({
-                "type": "function_call",
-                "id": fc.item_id,
-                "call_id": fc.call_id,
-                "name": fc.name,
-                "arguments": fc.arguments_json_str,
-                "status": "completed",
-            });
-            // namespace 字段(Codex.app dispatch MCP server 必填)
+            // [MOC-75] apply_patch 的 envelope item 也必须是 custom_tool_call(input=
+            // patch),跟流式 wire 一致 —— 否则严格客户端读 envelope 终态会当成
+            // function_call → Codex router abort。其余工具仍走 function_call。
+            let mut item = match &fc.apply_patch_input {
+                Some(input) => json!({
+                    "type": "custom_tool_call",
+                    "id": fc.item_id.clone(),
+                    "call_id": fc.call_id.clone(),
+                    "name": fc.name.clone(),
+                    "input": input,
+                    // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
+                    "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
+                }),
+                None => json!({
+                    "type": "function_call",
+                    "id": fc.item_id.clone(),
+                    "call_id": fc.call_id.clone(),
+                    "name": fc.name.clone(),
+                    "arguments": fc.arguments_json_str.clone(),
+                    "status": "completed",
+                }),
+            };
+            // namespace 字段(Codex.app dispatch MCP server 必填;apply_patch 无 namespace)
             if let Some(ns) = fc.namespace.as_ref() {
                 item["namespace"] = Value::String(ns.clone());
             }
@@ -1289,6 +1346,181 @@ impl GeminiToResponsesConverter {
             }
         };
 
+        // [MOC-75] apply_patch:Codex freeform custom tool,Codex CLI router 硬要求
+        // `custom_tool_call` wire(ToolPayload::Custom{input}),收 function_call 的
+        // Function payload 直接 abort。请求侧已把它降级成带 `input` 的 function,
+        // Gemini 回来的 args 形如 {"input":"*** Begin Patch..."}。这里解出 input、
+        // 一次性重打包成 custom_tool_call wire(对齐 chat responses/converter.rs::
+        // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
+        if name == APPLY_PATCH_TOOL_NAME {
+            let input = crate::responses::extract_apply_patch_input(&args_json_str);
+            let has_begin = input.contains("*** Begin Patch");
+            // [MOC-75 review] 两类畸形/截断都 emit `status="incomplete"` 阻止 Codex 执行
+            // partial/invalid apply_patch(destructive,partial 执行可能写错目标 —— 对齐
+            // #322 MOC-57 chat 路径破坏性半应用防护):
+            //   ① **完整但畸形**:有 `*** Begin Patch` 头但 hunk/operation/结构非法
+            //      (validate_v4a_syntax 拒)。
+            //   ② **响应级截断**:本 chunk finishReason=MAX_TOKENS / SAFETY 等 → patch 可能
+            //      被 token 上限切断(即使语法暂时合法)。finishReason 已在 candidate 循环
+            //      开头(part 之前)记录,故此处 self.final_finish_reason 对本 chunk 可见。
+            // Gemini functionCall.args 是一次性完整结构,不会跨 chunk 半截,故①只需语法后验、
+            // 不复用 chat 截断双检测器;②靠 finishReason 兜响应级截断。
+            //
+            // 空 / 裸串(无 `*** Begin Patch`)无 hunk 可半应用 → 保持 `completed` 原样透传,
+            // 让 Codex `parse_patch` 报错(非破坏性;test 2116 不变)。
+            let v4a_err = if has_begin {
+                crate::responses::validate_v4a_syntax(&input).err()
+            } else {
+                None
+            };
+            // 正向截断/畸形信号(**不含 None** —— part 处理时 None 仅表示"本 chunk 尚无
+            // finishReason",后续可能 STOP 正常收尾;断流 + 完整 functionCall 非破坏性,不 gate)。
+            // `MALFORMED_FUNCTION_CALL` / `MALFORMED_RESPONSE` 是 Gemini **自报本次产出畸形**
+            // 的信号(types.rs map_finish_reason)—— 对 destructive 的 apply_patch 风险最高,
+            // 必须 gate(即使 patch 文本碰巧通过 validate_v4a_syntax 宽松后验)。
+            //
+            // **边界**:此 gate 依赖 finishReason 与 functionCall part 同 chunk(Gemini wire
+            // 里 functionCall 与其 finishReason 同候选末 chunk 投递,常见情形成立)。跨 chunk
+            // (functionCall 在前、finishReason 在后)时本 gate 漏判,但**结构被截断的 patch
+            // 由不依赖 chunk 时序的 validate_v4a_syntax 兜底** emit incomplete,破坏性主防护不漏。
+            let response_truncated = matches!(
+                self.final_finish_reason.as_deref(),
+                Some("MAX_TOKENS")
+                    | Some("SAFETY")
+                    | Some("RECITATION")
+                    | Some("BLOCKLIST")
+                    | Some("PROHIBITED_CONTENT")
+                    | Some("SPII")
+                    | Some("IMAGE_SAFETY")
+                    | Some("IMAGE_PROHIBITED_CONTENT")
+                    | Some("MALFORMED_FUNCTION_CALL")
+                    | Some("MALFORMED_RESPONSE")
+            ) || self.final_finish_reason.as_deref()
+                == Some(FINISH_INTERRUPTED);
+            let incomplete = v4a_err.is_some() || response_truncated;
+            if let Some(ref e) = v4a_err {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_V4A_INVALID",
+                    call_id = %call_id,
+                    model = %self.model,
+                    line = e.line,
+                    message = %e.message,
+                    "Gemini apply_patch V4A 语法校验失败(完整但畸形)→ emit status=incomplete \
+                     阻止破坏性半应用;排查该 Gemini 模型 misbehave",
+                );
+            } else if response_truncated {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_TRUNCATED",
+                    call_id = %call_id,
+                    model = %self.model,
+                    finish_reason = %self.final_finish_reason.as_deref().unwrap_or(""),
+                    "Gemini apply_patch 响应级截断(finishReason 非 STOP)→ patch 可能被切断,\
+                     emit status=incomplete 阻止 Codex 执行不完整 patch",
+                );
+            } else if !has_begin {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_NO_V4A_ENVELOPE",
+                    call_id = %call_id,
+                    model = %self.model,
+                    args_preview = %args_json_str.chars().take(120).collect::<String>(),
+                    "Gemini apply_patch 回包不含 V4A 信封(没按 `input` 填 / 填错 key);\
+                     原样透传给 Codex,parse_patch 将失败 — 排查该 Gemini 模型 misbehave",
+                );
+            }
+            let status = if incomplete {
+                "incomplete"
+            } else {
+                "completed"
+            };
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "custom_tool_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "name": name,
+                        "input": "",
+                        "status": "in_progress",
+                    },
+                }),
+            );
+            // incomplete 时跳过 input.delta + input.done —— 不发"输入已就绪"信号,
+            // 对齐 chat 路径(防 Codex 把畸形 patch 当 ready 去执行)。
+            if !incomplete {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.custom_tool_call_input.delta",
+                    json!({
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": item_id.clone(),
+                        "output_index": output_index,
+                        "call_id": call_id.clone(),
+                        "delta": input.clone(),
+                    }),
+                );
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item_id.clone(),
+                        "output_index": output_index,
+                        "call_id": call_id.clone(),
+                        "input": input.clone(),
+                    }),
+                );
+            }
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "custom_tool_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "name": name,
+                        "input": input.clone(),
+                        "status": status,
+                    },
+                }),
+            );
+            // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
+            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。
+            if !incomplete {
+                crate::responses::global_tool_call_cache().save(
+                    &call_id,
+                    crate::responses::ToolCallEntry {
+                        name: name.to_owned(),
+                        arguments: args_json_str.clone(),
+                    },
+                );
+            }
+            self.closed_function_calls.push(ClosedFunctionCall {
+                item_id,
+                output_index,
+                call_id,
+                name: name.to_owned(),
+                arguments_json_str: args_json_str,
+                namespace: None,
+                apply_patch_input: Some(input),
+                apply_patch_incomplete: incomplete,
+            });
+            return;
+        }
+
         // **MCP namespace 字段**:如 function.name 来自 namespace 包装(从
         // `tool_namespace_map` 反查表查到),给 output_item.added / .done /
         // envelope item 全部加 `namespace: "mcp__<server>__"` —— Codex.app
@@ -1371,6 +1603,8 @@ impl GeminiToResponsesConverter {
             name: name.to_owned(),
             arguments_json_str: args_json_str,
             namespace: namespace_for,
+            apply_patch_input: None,
+            apply_patch_incomplete: false,
         });
     }
 
@@ -1909,6 +2143,188 @@ mod tests {
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["q"], "weather");
         assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    // [MOC-75] apply_patch 必须重打包成 custom_tool_call wire(Codex CLI router
+    // 硬要求),且 input 必须是完整 patch 文本 —— 修复前 args 空 → aborted。
+    #[test]
+    fn apply_patch_function_call_rewritten_to_custom_tool_call_with_input() {
+        // 请求侧已给 apply_patch 补了 `input` 参数,Gemini 回来的 args={"input": patch}
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        // 必走 custom_tool_call wire,**不**走 function_call_arguments wire
+        assert!(
+            names.contains(&"response.custom_tool_call_input.delta".into()),
+            "events: {names:?}"
+        );
+        assert!(names.contains(&"response.custom_tool_call_input.done".into()));
+        assert!(
+            !names.contains(&"response.function_call_arguments.delta".into()),
+            "apply_patch 不该走 function_call wire(否则 Codex router abort)"
+        );
+        // output_item.added item.type == custom_tool_call
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.output_item.added")
+            .unwrap();
+        assert_eq!(added.1["item"]["type"], "custom_tool_call");
+        // completed envelope output[] 是 custom_tool_call + input 完整(根因修复点)
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        let input = item["input"].as_str().unwrap();
+        assert!(
+            input.contains("*** Begin Patch") && input.contains("+hello"),
+            "input 必须是完整 patch 文本(非空),实际: {input:?}"
+        );
+    }
+
+    // [MOC-75 review C7] Gemini 没按 `input` 填(原 bug 形态 args={}):仍走
+    // custom_tool_call wire(不 panic、不回落 function_call),input 无 V4A 信封
+    // (warn 已在主路径记;Codex parse_patch 会 surface 真错,非破坏性)。
+    #[test]
+    fn apply_patch_empty_args_still_emits_custom_tool_call_wire() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        // 仍走 custom_tool_call wire(不回落 function_call → 不会被 router 当 Function abort)
+        assert!(
+            names.contains(&"response.custom_tool_call_input.done".into()),
+            "空 args 也必须走 custom_tool_call wire,events: {names:?}"
+        );
+        assert!(!names.contains(&"response.function_call_arguments.delta".into()));
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        // 空 args → input 无 V4A 信封(确认没把 "{}" 当成有效 patch)
+        assert!(!item["input"].as_str().unwrap().contains("*** Begin Patch"));
+    }
+
+    /// [MOC-75 silent-failure review] 完整但畸形的 V4A patch(有 `*** Begin Patch` 头
+    /// 但非法 operation marker)→ emit `status=incomplete` 阻止 Codex 破坏性半应用,
+    /// 且跳过 `custom_tool_call_input.done`,envelope 终态也 incomplete(对齐 #322 chat 路径)。
+    #[test]
+    fn apply_patch_malformed_v4a_emits_incomplete() {
+        // 有 Begin/End Patch 但 operation 非法(Frobnicate)→ validate_v4a_syntax 拒绝;
+        // repair 无法把未知 operation 修成合法 → incomplete。
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Frobnicate File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        // 仍走 custom_tool_call wire(不回落 function_call)
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "完整但畸形的 V4A 必须 status=incomplete(阻止破坏性半应用)"
+        );
+        // incomplete 不发 input.done(不发就绪信号)
+        assert!(
+            !parsed
+                .iter()
+                .any(|(n, _)| n == "response.custom_tool_call_input.done"),
+            "incomplete 路径不该 emit custom_tool_call_input.done"
+        );
+        // envelope 终态也 incomplete
+        let completed = parsed
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(
+            item["status"], "incomplete",
+            "envelope 终态也必须 incomplete"
+        );
+    }
+
+    /// [MOC-75 review P1] 语法合法但响应被 `MAX_TOKENS` 截断的 apply_patch → status=incomplete
+    /// + 跳过 input.done(patch 可能被 token 上限切断)。验证 finishReason 在 part 之前记录
+    /// 使 emit_function_call 可见,防 Codex 执行被截断的 patch。
+    #[test]
+    fn apply_patch_truncated_by_max_tokens_emits_incomplete() {
+        // 合法 V4A patch,但同 chunk finishReason=MAX_TOKENS(响应级截断)
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"MAX_TOKENS"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "MAX_TOKENS 截断的 apply_patch 必须 status=incomplete(即使语法合法)"
+        );
+        assert!(
+            !parsed
+                .iter()
+                .any(|(n, _)| n == "response.custom_tool_call_input.done"),
+            "截断路径不该 emit custom_tool_call_input.done"
+        );
+    }
+
+    /// [MOC-75 silent-failure review] Gemini 自报 `MALFORMED_FUNCTION_CALL`(本次产出的
+    /// functionCall 畸形)→ apply_patch 即使语法看似合法也必须 status=incomplete
+    /// (destructive 风险最高的 Gemini 专属信号,必须在 gate 列表里)。
+    #[test]
+    fn apply_patch_malformed_function_call_finish_reason_emits_incomplete() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "MALFORMED_FUNCTION_CALL 的 apply_patch 必须 incomplete"
+        );
     }
 
     #[test]
@@ -2525,6 +2941,42 @@ mod tests {
             added.1["item"].get("namespace").is_none(),
             "顶级 function 不该带 namespace 字段,实际 {:?}",
             added.1["item"].get("namespace")
+        );
+    }
+
+    /// [MOC-75 devin BUG 回归] `build_assistant_message_for_session` 必须把
+    /// `custom_tool_call`(apply_patch)纳入 session 历史 —— 重建成 function-type
+    /// tool_call、arguments=`{"input":<patch>}`(与请求侧 `custom_tool_call` 回放一致)。
+    /// 否则下一轮 `previous_response_id` 续话缺这条 apply_patch call,新进来的
+    /// `custom_tool_call_output`(functionResponse)无匹配 functionCall → 多轮断。
+    #[test]
+    fn session_assistant_message_includes_apply_patch_custom_tool_call() {
+        let output_items = vec![json!({
+            "type": "custom_tool_call",
+            "call_id": "call_ap1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch",
+            "status": "completed"
+        })];
+        let msg = GeminiToResponsesConverter::build_assistant_message_for_session(&output_items)
+            .expect("custom_tool_call 必须产出 session assistant message");
+        let tcs = msg["tool_calls"]
+            .as_array()
+            .expect("session message 必须含 tool_calls");
+        assert_eq!(
+            tcs.len(),
+            1,
+            "apply_patch custom_tool_call 必须进 session tool_calls(不能被 _=>{{}} 丢弃)"
+        );
+        let tc = &tcs[0];
+        assert_eq!(tc["id"], "call_ap1");
+        assert_eq!(tc["type"], "function", "session 历史用 chat function-type");
+        assert_eq!(tc["function"]["name"], "apply_patch");
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["input"], "*** Begin Patch\n*** End Patch",
+            "arguments 必须是 {{\"input\":<patch>}},与请求侧回放形态一致"
         );
     }
 }
