@@ -39,6 +39,43 @@ pub use responses::{
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
+/// 把上游 HTTP 错误状态 + 错误线索映射到 Codex 能理解的 `response.failed.error.code`。
+///
+/// 目的不是保留 provider 原始细分类,而是把会让 Codex 卡住的 raw HTTP 失败
+/// 统一改写成客户端能消费的 Responses 失败语义:
+/// - 永久错误 → `invalid_prompt`(surface + 停手,不自动重试)
+/// - 瞬时错误 → `timeout` / `rate_limited` / `quota_exceeded` / `server_error`
+/// - 兜底未知 → `upstream_error`
+pub fn codex_error_code_for_upstream_status(
+    status_u16: u16,
+    upstream_status_text: Option<&str>,
+    upstream_message: Option<&str>,
+) -> &'static str {
+    match status_u16 {
+        400 | 401 | 403 | 404 | 405 => "invalid_prompt",
+        408 | 504 => "timeout",
+        429 => {
+            let status_is_quota = upstream_status_text
+                .map(|s| s.eq_ignore_ascii_case("RESOURCE_EXHAUSTED"))
+                .unwrap_or(false);
+            let message_is_quota = upstream_message
+                .map(|m| {
+                    let lower = m.to_ascii_lowercase();
+                    lower.contains("quota")
+                        || lower.contains("resource_exhausted")
+                })
+                .unwrap_or(false);
+            if status_is_quota || message_is_quota {
+                "quota_exceeded"
+            } else {
+                "rate_limited"
+            }
+        }
+        500..=599 => "server_error",
+        _ => "upstream_error",
+    }
+}
+
 /// 把"丢弃某个未知 Responses 工具 type"的告警在整个进程内**每个 type 只 warn 一次**。
 ///
 /// Codex CLI 多轮对话每轮都会重发完整 tools 列表,普通 `tracing::warn!` 会让相同
@@ -122,7 +159,7 @@ pub(crate) fn normalize_v1_prefix(path: &str) -> String {
 
 #[cfg(test)]
 mod normalize_v1_prefix_tests {
-    use super::normalize_v1_prefix;
+    use super::{codex_error_code_for_upstream_status, normalize_v1_prefix};
 
     #[test]
     fn strips_v1_chat() {
@@ -158,5 +195,37 @@ mod normalize_v1_prefix_tests {
     #[test]
     fn empty_becomes_root() {
         assert_eq!(normalize_v1_prefix(""), "/");
+    }
+
+    #[test]
+    fn 401_maps_to_invalid_prompt() {
+        assert_eq!(
+            codex_error_code_for_upstream_status(401, Some("UNAUTHENTICATED"), Some("bad key")),
+            "invalid_prompt"
+        );
+    }
+
+    #[test]
+    fn 429_quota_maps_to_quota_exceeded() {
+        assert_eq!(
+            codex_error_code_for_upstream_status(
+                429,
+                Some("RESOURCE_EXHAUSTED"),
+                Some("quota exceeded"),
+            ),
+            "quota_exceeded"
+        );
+    }
+
+    #[test]
+    fn 429_non_quota_maps_to_rate_limited() {
+        assert_eq!(
+            codex_error_code_for_upstream_status(
+                429,
+                Some("UNAVAILABLE"),
+                Some("too many concurrent requests"),
+            ),
+            "rate_limited"
+        );
     }
 }
