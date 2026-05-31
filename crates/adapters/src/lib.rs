@@ -329,9 +329,15 @@ mod codex_retry_code_tests {
         assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
         assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
         assert_eq!(codex_retry_code("server_error"), "server_error");
-        assert_eq!(codex_retry_code("service_unavailable"), "service_unavailable");
+        assert_eq!(
+            codex_retry_code("service_unavailable"),
+            "service_unavailable"
+        );
         assert_eq!(codex_retry_code("upstream_error"), "upstream_error");
-        assert_eq!(codex_retry_code("upstream_transport_error"), "upstream_transport_error");
+        assert_eq!(
+            codex_retry_code("upstream_transport_error"),
+            "upstream_transport_error"
+        );
         assert_eq!(codex_retry_code("upstream_truncated"), "upstream_truncated");
         assert_eq!(codex_retry_code("grok_stream_error"), "grok_stream_error");
     }

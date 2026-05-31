@@ -1950,8 +1950,12 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                 let mut conv = GeminiToResponsesConverter::new(orig, None);
                 // `code` 是内部语义分类;真正写进 envelope.error.code 的是 Codex 认识的
                 // retry-control code(见 codex_retry_code)。语义 kind 保留在 upstream_error_kind。
-                let out =
-                    conv.emit_failure(crate::codex_retry_code(code), code, &error_message, status_u16);
+                let out = conv.emit_failure(
+                    crate::codex_retry_code(code),
+                    code,
+                    &error_message,
+                    status_u16,
+                );
                 Some((Ok(Bytes::from(out)), (input, None, true)))
             },
         ),
