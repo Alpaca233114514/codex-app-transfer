@@ -19,6 +19,8 @@ pub mod server;
 pub mod telemetry;
 pub mod validation;
 
+mod chatgpt_auth;
+
 pub use diagnostics::{feedback_bundle_dir, recent_feedback_bundles};
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{

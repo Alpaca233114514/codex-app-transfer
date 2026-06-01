@@ -32,6 +32,9 @@ use futures_util::TryStreamExt;
 use thiserror::Error;
 
 use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
+use crate::chatgpt_auth::{
+    extract_bearer_token, is_active_chatgpt_bearer, is_gateway_bearer,
+};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
@@ -636,10 +639,39 @@ fn is_chatgpt_backend_path(path: &str) -> bool {
 /// [MOC-126] 虚拟 userID，用于向 Codex 注入伪造账号信息。
 const MOCK_USER_ID: &str = "user-00000000-0000-4000-a000-000000000000";
 
-/// 检查请求是否携带真实的 ChatGPT 认证信息（Bearer token 或 session cookie）。
-/// 若携带，视为 relay 真实账号，继续透传；否则可走 mock 路径。
+/// 检查请求是否携带真实的 ChatGPT 认证信息。
+/// `Bearer cas_*` 是 transfer gateway key,不是 ChatGPT token,不能阻止 mock。
 fn has_real_chatgpt_auth(headers: &HeaderMap) -> bool {
-    headers.contains_key("authorization") || headers.contains_key("cookie")
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer_token)
+        .is_some_and(|token| !is_gateway_bearer(token) && is_active_chatgpt_bearer(token))
+        || headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(cookie_looks_like_chatgpt_session)
+}
+
+/// Cookie 只有看起来是 chatgpt.com 会话 cookie 时才算真实账号。
+fn cookie_looks_like_chatgpt_session(cookie: &str) -> bool {
+    cookie.split(';').any(|part| {
+        let name = part
+            .trim()
+            .split_once('=')
+            .map(|(name, _)| name.trim())
+            .unwrap_or_else(|| part.trim());
+        matches!(
+            name,
+            "__Secure-next-auth.session-token"
+                | "__Host-next-auth.csrf-token"
+                | "__Secure-next-auth.callback-url"
+                | "oai-sc"
+                | "oai-did"
+                | "oai-hlib"
+                | "cf_clearance"
+        )
+    })
 }
 
 /// [MOC-126] 尝试对 chatgpt backend 请求返回 mock 响应。
@@ -655,6 +687,8 @@ fn try_mock_chatgpt_backend(path: &str, method: &Method) -> Option<Response> {
             "name": "Mock User",
             "picture": null,
             "created": "2024-01-01T00:00:00.000Z",
+            "user": mock_user_json(),
+            "account": mock_account_json(),
             "account_plan": {
                 "is_paid_subscription_active": false,
                 "subscription_plan": "chatgpt_free",
@@ -667,18 +701,51 @@ fn try_mock_chatgpt_backend(path: &str, method: &Method) -> Option<Response> {
             "name": "Mock User",
             "email": "mock@example.com",
             "picture": null,
-            "created": "2024-01-01T00:00:00.000Z"
+            "created": "2024-01-01T00:00:00.000Z",
+            "user": mock_user_json()
         }))),
         ("GET", p) if p.starts_with("/backend-api/accounts/") => Some(mock_json(200, serde_json::json!({
             "accounts": [{
                 "id": MOCK_USER_ID,
+                "account_id": MOCK_USER_ID,
+                "user_id": MOCK_USER_ID,
                 "name": "Mock User",
                 "email": "mock@example.com",
-                "status": "active"
+                "status": "active",
+                "user": mock_user_json(),
+                "account": mock_account_json()
             }]
         }))),
         _ => None,
     }
+}
+
+fn mock_user_json() -> serde_json::Value {
+    serde_json::json!({
+        "id": MOCK_USER_ID,
+        "user_id": MOCK_USER_ID,
+        "object": "user",
+        "name": "Mock User",
+        "email": "mock@example.com",
+        "picture": null,
+        "created": "2024-01-01T00:00:00.000Z"
+    })
+}
+
+fn mock_account_json() -> serde_json::Value {
+    serde_json::json!({
+        "id": MOCK_USER_ID,
+        "account_id": MOCK_USER_ID,
+        "user_id": MOCK_USER_ID,
+        "name": "Mock User",
+        "email": "mock@example.com",
+        "status": "active",
+        "account_plan": {
+            "is_paid_subscription_active": false,
+            "subscription_plan": "chatgpt_free",
+            "has_active_subscription": false
+        }
+    })
 }
 
 /// 构造 mock JSON Response。
@@ -703,8 +770,9 @@ async fn passthrough_chatgpt_backend(
     body: Bytes,
 ) -> Result<Response, ForwardError> {
     let telemetry = proxy_telemetry();
-    // [MOC-126] 若请求不带真实 auth/cookie，尝试返回 mock 响应注入 userID。
-    if !has_real_chatgpt_auth(headers) {
+    let has_real_auth = has_real_chatgpt_auth(headers);
+    // [MOC-126] 若请求不带真实 ChatGPT auth/cookie，尝试返回 mock 响应注入 userID。
+    if !has_real_auth {
         if let Some(mock) = try_mock_chatgpt_backend(client_path, method) {
             telemetry.logs.add(
                 "INFO",
@@ -712,6 +780,11 @@ async fn passthrough_chatgpt_backend(
             );
             return Ok(mock);
         }
+    } else {
+        telemetry.logs.add(
+            "INFO",
+            format!("[chatgpt-relay] real auth {method} {client_path}"),
+        );
     }
     let upstream = format!("https://chatgpt.com{client_path}");
     telemetry.logs.add(
@@ -2236,16 +2309,17 @@ mod tests {
         assert_eq!(v["id"], MOCK_USER_ID);
         assert_eq!(v["account_id"], MOCK_USER_ID);
         assert_eq!(v["user_id"], MOCK_USER_ID);
+        assert_eq!(v["user"]["id"], MOCK_USER_ID);
+        assert_eq!(v["account"]["id"], MOCK_USER_ID);
         assert_eq!(v["email"], "mock@example.com");
     }
 
     #[test]
-    fn mock_misses_with_auth_header() {
-        // try_mock_chatgpt_backend 本身不检查 header，
-        // 但 has_real_chatgpt_auth 会在 passthrough_chatgpt_backend 中先拦截。
-        // 这里只测 mock 路由表对未知路径返回 None。
-        let resp = try_mock_chatgpt_backend("/backend-api/unknown", &Method::GET);
-        assert!(resp.is_none());
+    fn gateway_bearer_does_not_count_as_real_chatgpt_auth() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer cas_test_gateway".parse().unwrap());
+        assert!(!has_real_chatgpt_auth(&h));
+        assert!(try_mock_chatgpt_backend("/backend-api/getAccount", &Method::GET).is_some());
     }
 
     #[test]
@@ -2258,6 +2332,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["id"], MOCK_USER_ID);
         assert_eq!(v["object"], "user");
+        assert_eq!(v["user"]["id"], MOCK_USER_ID);
     }
 
     #[test]
@@ -2272,17 +2347,63 @@ mod tests {
     }
 
     #[test]
-    fn has_real_chatgpt_auth_detects_authorization() {
+    fn post_backend_does_not_mock() {
+        assert!(try_mock_chatgpt_backend("/backend-api/getAccount", &Method::POST).is_none());
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_ignores_non_chatgpt_bearer() {
         let mut h = HeaderMap::new();
-        h.insert("authorization", "Bearer real-token".parse().unwrap());
+        h.insert("authorization", "Bearer sk-not-chatgpt".parse().unwrap());
+        assert!(!has_real_chatgpt_auth(&h));
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_detects_active_chatgpt_bearer() {
+        use base64::Engine;
+        use std::io::Write;
+
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc_test"}
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join("auth.json")).unwrap();
+        write!(
+            f,
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{token}","refresh_token":"rt"}}}}"#
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", dir.path());
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert!(has_real_chatgpt_auth(&h));
+
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_detects_chatgpt_cookie() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            "__Secure-next-auth.session-token=abc".parse().unwrap(),
+        );
         assert!(has_real_chatgpt_auth(&h));
     }
 
     #[test]
-    fn has_real_chatgpt_auth_detects_cookie() {
+    fn has_real_chatgpt_auth_ignores_unrelated_cookie() {
         let mut h = HeaderMap::new();
-        h.insert("cookie", "session=abc".parse().unwrap());
-        assert!(has_real_chatgpt_auth(&h));
+        h.insert("cookie", "theme=dark; session=abc".parse().unwrap());
+        assert!(!has_real_chatgpt_auth(&h));
     }
 
     #[test]

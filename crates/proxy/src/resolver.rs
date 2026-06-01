@@ -17,6 +17,8 @@ use codex_app_transfer_registry::model_alias::{
 use codex_app_transfer_registry::Provider;
 use thiserror::Error;
 
+use crate::chatgpt_auth::{extract_bearer_token, is_active_chatgpt_bearer};
+
 /// 已解析的"下一跳上游"信息.
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
@@ -194,7 +196,7 @@ impl StaticResolver {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let token = actual.strip_prefix("Bearer ").unwrap_or(actual);
+        let token = extract_bearer_token(actual).unwrap_or(actual.trim());
         if token == expected {
             return Ok(());
         }
@@ -206,7 +208,7 @@ impl StaticResolver {
         // 为:形状是 chatgpt JWT **且逐字 == 本地活动 auth.json 里 Codex 真在用的 access_token**
         // —— 自造 token 不匹配本地真 token 即拒。实时读盘(relay 下 transfer 不刷新、Codex 自刷
         // auth.json,构造时传会 stale)。安全锚:放行的凭据来自本地 auth 文件、而非未签名 claim。
-        if is_chatgpt_access_token(token) && token_matches_active_chatgpt(token) {
+        if is_active_chatgpt_bearer(token) {
             return Ok(());
         }
         Err(ResolveError::Unauthorized)
@@ -325,58 +327,6 @@ fn decide_provider<'a>(
     }
     // 没 / 或没可映射 model → 走默认 provider.
     Some((provider, None))
-}
-
-/// 判断 Bearer 是否是 OpenAI ChatGPT 的 access_token —— JWT(三段)且 payload 含
-/// `https://api.openai.com/auth.chatgpt_account_id`。relay 模式(活动 auth.json 是真实
-/// chatgpt)下 Codex 模型请求发此 token 到 proxy,`check_gateway` 据此放行(身份比静态
-/// cas_ gateway key 更硬,且 `decide_provider` 不依赖 gateway key 即可按 active_provider
-/// 转发)。验 claim 而非只看 JWT 格式,挡掉随机乱 token。
-fn is_chatgpt_access_token(token: &str) -> bool {
-    use base64::Engine;
-    // JWT = header.payload.signature,正好三段且签名非空。
-    let mut it = token.split('.');
-    let payload = match (it.next(), it.next(), it.next(), it.next()) {
-        (Some(_h), Some(p), Some(sig), None) if !sig.is_empty() && !p.is_empty() => p,
-        _ => return false,
-    };
-    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    v.get("https://api.openai.com/auth")
-        .and_then(|a| a.get("chatgpt_account_id"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty())
-}
-
-/// [connector P1 review] relay 放行的安全锚:incoming token 必须**逐字 == 本地活动
-/// `auth.json` 里 Codex 真在用的 `tokens.access_token`。仅验 JWT claim
-/// ([`is_chatgpt_access_token`])挡不住自造的未签名 chatgpt 形状 JWT —— proxy 无 OpenAI
-/// 公钥、无法验签名,故改以「本地真 token 比对」作为身份证明:能发出 == 本地 access_token
-/// 的请求,等于已持有 auth.json,同样能拿 config 里的 cas_ gateway key,门槛相同;自造 token
-/// 不匹配即拒。**实时读盘**:relay 下 transfer 不刷新、Codex 自刷 auth.json,缓存/构造时传
-/// 会 stale 拒掉刚刷新的真 token。proxy 不依赖 codex_integration,按 `CODEX_HOME`(优先)/
-/// `~/.codex` 自拼路径读;读失败 / 非 chatgpt / 不匹配 → false(回退到只认 cas_)。
-fn token_matches_active_chatgpt(token: &str) -> bool {
-    let base = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
-    let Some(path) = base.map(|b| b.join("auth.json")) else {
-        return false;
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    v.get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|active| !active.is_empty() && active == token)
 }
 
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
