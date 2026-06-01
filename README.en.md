@@ -64,9 +64,9 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - **Two-layer session history persistence**: L1 in-memory LRU + L2 sqlite with 30-day TTL (`~/.codex-app-transfer/sessions.db`), preserving history across `.app` restarts
 - Codex App config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
 - **Codex Doc Management** (Sidebar → Codex):
-  - **Agents**: raw read/write `AGENTS.md` at any path with file system picker; auto-classify project-root / subdir via `.git/` detection with chip labels
-  - **Memories**: fixed two entries `~/.codex/memories/MEMORY.md` (main index) + `memory_summary.md` (auto summary) — the only two user-editable AI memory indexes that codex actually reads
-  - **Skills**: scan `~/.codex/skills/<name>/SKILL.md` for raw editing; "Open folder" button shells out to `open` so users edit non-SKILL.md companion files (scripts / examples / templates) in Finder/Explorer
+  - **Agents**: raw read/write for non-sensitive `AGENTS.md` paths under HOME with file system picker; system and credential directories are rejected, with project-root / subdir chip labels from `.git/` detection
+  - **Memories**: fixed entries `~/.codex/memories/MEMORY.md` (main index) + `memory_summary.md` (auto summary), plus non-sensitive project `MEMORY.md` paths under HOME; system and credential directories are rejected
+  - **Skills**: scan `~/.codex/skills/<name>/SKILL.md` for raw editing and keep hash resolution inside the skills root; "Open folder" button shells out to `open` so users edit non-SKILL.md companion files (scripts / examples / templates) in Finder/Explorer
   - **MCP**: structured JSON editing on the `[mcp_servers.*]` section of `~/.codex/config.toml` (`toml_edit` round-trip preserves comments + sibling config sections); Plugins sub-tab scans `~/.codex/plugins/cache/` for installed bundles (enable toggle / uninstall); all writes are atomic + independent history per SHA-256 path hash (no cross-tab interference)
 - Real-time logs panel auto-refreshing every 2s; unified `tracing::warn!(error_id, detail)` with stable tokens — operators can grep / aggregate
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
