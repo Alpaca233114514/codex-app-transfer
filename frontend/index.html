@@ -472,12 +472,52 @@
           <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.autoUnlockCodexPlugins">自动解锁 Codex Plugins</strong>
             <div>
-              <div class="settings-inline-actions">
+              <!-- MOC-104:开关 + 真实账号按钮同一行,重启 Codex 推到最右 -->
+              <div class="settings-inline-actions" style="flex-wrap:wrap;align-items:center;">
                 <label class="switch-label only-switch"><input type="checkbox" id="autoUnlockCodexPlugins" checked><span class="switch-ui"></span></label>
-                <button type="button" class="btn btn-sm btn-outline-primary" id="autoUnlockRestartCodex" data-action="auto-unlock-restart-codex" data-i18n="settings.autoUnlockRestartCodex">重启 Codex</button>
+                <button class="btn btn-sm btn-outline-primary" type="button" data-action="real-account-login" data-i18n="realAccount.login">登录真实账号</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-import" data-i18n="realAccount.import">导入文件</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-force-enable" data-i18n="realAccount.forceEnable">强制开启(高延迟)</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-forget" id="realAccountForgetBtn" style="display:none;" data-i18n="realAccount.forget">清除真实账号</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" id="autoUnlockRestartCodex" data-action="auto-unlock-restart-codex" data-i18n="settings.autoUnlockRestartCodex" style="margin-left:auto;">重启 Codex</button>
               </div>
               <p class="settings-note" data-i18n="settings.autoUnlockCodexPluginsHint">此功能需要通过本应用内启动 Codex 才能正常使用。点击右侧「重启 Codex」可直接重启 Codex 并触发自动注入。</p>
-              <p class="settings-note" id="pluginUnlockRuntimeStatus" data-i18n="settings.pluginUnlockRuntimeStatus">运行时状态：未检测</p>
+              <p class="settings-note" data-i18n="realAccount.sectionHint">真实账号模式:用真实 ChatGPT 账号登录,避开 CDP 伪造登录带来的额外启动延迟。登录后自动长期保留,活动 auth.json 被改写也会在启动时自动恢复。</p>
+              <p class="settings-note" style="margin-top:6px;">
+                <span data-i18n="realAccount.runStatusLabel">运行状态</span>:<strong id="raRunStatus">—</strong>
+                <span style="margin:0 12px;opacity:.4;">·</span>
+                <span data-i18n="realAccount.acctStatusLabel">账号状态</span>:<strong id="raAcctStatus">—</strong>
+              </p>
+            </div>
+          </div>
+          <!-- MOC-104 强制开启二次确认弹窗(高延迟警告)。Tauri webview 的 window.confirm
+               不稳定,用 app 自己的 codex-modal 保证可见 -->
+          <div class="codex-modal-backdrop" id="realAccountForceEnableModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="realAccount.forceEnableTitle">强制开启(高延迟)</h3>
+                <button class="codex-modal-close" type="button" data-action="real-account-force-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="realAccount.forceEnableWarn">强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多一段明显的加载延迟(Windows 上可能长达数十秒)。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?</p>
+              <div class="codex-modal-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-force-cancel" data-i18n="common.cancel">取消</button>
+                <button class="btn btn-sm btn-outline-warning" type="button" data-action="real-account-force-confirm" data-i18n="realAccount.forceEnableConfirm">确定强制开启</button>
+              </div>
+            </div>
+          </div>
+          <!-- MOC-104 手动开「自动解锁」但无有效真实账号时的引导弹窗(登录优先 / 强制兜底) -->
+          <div class="codex-modal-backdrop" id="realAccountNoAccountModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="realAccount.noAccountTitle">未检测到有效账号</h3>
+                <button class="codex-modal-close" type="button" data-action="real-account-noacct-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="realAccount.noAccountDesc">未检测到有效的真实 ChatGPT 账号。请登录一个有效账号(推荐:Codex 原生显示 Plugins,无额外启动延迟),或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。</p>
+              <div class="codex-modal-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-noacct-cancel" data-i18n="common.cancel">取消</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-noacct-force" data-i18n="realAccount.forceEnable">强制开启(高延迟)</button>
+                <button class="btn btn-sm btn-outline-primary" type="button" data-action="real-account-noacct-login" data-i18n="realAccount.login">登录真实账号</button>
+              </div>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

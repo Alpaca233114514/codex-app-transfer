@@ -5,6 +5,7 @@
 
 mod admin;
 mod codex_plugin_unlocker;
+mod codex_real_account;
 mod codex_theme_injector;
 mod proxy_runner;
 mod telemetry_bridge;
@@ -198,37 +199,100 @@ fn main() {
                 // 前 emit 丢失,见 chatgpt-codex-connector P2),改由前端 load 时轮询
                 // `GET /api/desktop/mcp-credentials/status` 决定是否弹确认。
                 let _ = handlers::desktop::mcp_credentials_startup_sync("startup");
+
+                // [MOC-104 req#2/#5 启动调谐] **必须在 auto_apply 落盘之后**才跑 —— 否则
+                // 跟 auto_apply 抢写 `~/.codex/auth.json`:reconcile 先跑会看到上次退出
+                // 恢复的旧 chatgpt 态而 no-op,随后 auto_apply 写 apikey 把导入镜像的恢复
+                // 默默吞掉;反之又会撤销 auto_apply 的 apikey。复用本 post-apply task(已
+                // await 完 auto_apply)确定性串在 apply 之后,不再用 sleep 猜时机(MOC-54)。
+                // best-effort:无真实账号 / token 未过期则 no-op,失败只 log。
+                // [MOC-104 分流] reconcile **不再刷新 token**(不构造 HTTP client)——刷新权
+                // 归源头 Codex(Official 本机自刷 / Imported 源那边刷)与「登录」入口。启动
+                // 只做「检测 + 必要时从导入镜像恢复」,杜绝跟外部 Codex 抢 single-use
+                // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
+                {
+                    use crate::codex_real_account::RefreshOutcome;
+                    match crate::codex_real_account::reconcile_on_startup().await {
+                        // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
+                        // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
+                        Ok(RefreshOutcome::ReloginRequired { .. }) => {
+                            tracing::warn!(
+                                "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
+                            );
+                            // 关开关只在原本是 on 时有动作;但事件**无论开关原态都 emit**
+                            // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
+                            // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
+                            let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
+                            if let Some(window) =
+                                app_handle_for_residual_scan.get_webview_window("main")
+                            {
+                                let _ = window.emit("real-account-relogin-required", ());
+                            }
+                        }
+                        Ok(outcome) => tracing::info!(
+                            "[RealAccount] 启动调谐(检测 + 必要时从导入镜像恢复,不刷新): {outcome:?}"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
+                        }
+                    }
+                }
+                // [MOC-104] reconcile 已把活动账号 settle 完。relay 模式下真实 chatgpt
+                // 活动 → Codex 据 `auth_mode==chatgpt` **原生**显示 Plugins 入口(实测:
+                // bundle `pluginsDisabledTooltip` descriptor「API-key users → disabled
+                // Plugins nav」),**不再需要 CDP daemon 注入**(消除 MOC-100 高延迟)。
+                // 这里不启 daemon;daemon 只留给「无真实账号 + 显式强制开启」档(下方 task)。
             });
 
+            // ── [MOC-104] 真实账号解锁一次性迁移 ──
+            // 老版本 autoUnlockCodexPlugins 默认 true 会直接拉起 CDP 伪造注入 daemon;真实
+            // 账号模式上线后,**无真实账号时**的高延迟 CDP 路径改为「显式强制开启」才走。
+            // 同步执行(在 daemon 决策 + 任何 Codex 启动前),硬重置升级用户残留的旧 true。幂等。
+            if handlers::settings::migrate_real_account_unlock_v1() {
+                tracing::info!(
+                    "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
+                );
+            }
+
             // ── Plugin Unlock 守护进程自动启动 ──
-            // 默认开启;用户显式关掉 autoUnlockCodexPlugins=false 才跳过 auto-start。
-            // 必须复用 handlers::plugin_unlock 的 OnceCell 单例,否则会跟前端
-            // 手动 start 出来的 service 各自跑一份,frontend 查 status 看到的
-            // 是 OnceCell 那份 → 永远 Disconnected。
+            // [MOC-104] daemon = CDP 注入 `setAuthMethod('chatgpt')`,把 React authMethod
+            // 伪造成 chatgpt 来解锁 Plugins 入口。它**只**对「活动 auth.json 是 apikey」的
+            // 用户有意义,且伪造态与磁盘 apikey 不匹配 → Codex 重新初始化登录态(MOC-100
+            // ~5.8s 高延迟)。relay 模式上线后:
+            // ① 活动是真实 chatgpt → Codex 据 `auth_mode==chatgpt` **原生**显示 Plugins,
+            //    **不启 daemon**(无注入、无不匹配、无高延迟);apply.rs relay 分支保证切
+            //    provider 时也保留 chatgpt 态,入口持续可见。
+            // ② 活动是 apikey + 用户显式强制开启 → 跑 daemon(伪造,用户已接受高延迟);
+            // ③ 活动是 apikey + 未强制开启 → 不跑(消除「默默高延迟」,用户原始诉求)。
+            // 复用 handlers::plugin_unlock 的 OnceCell 单例(否则跟前端手动 start 各跑一份)。
             tauri::async_runtime::spawn(async move {
-                // 启动延迟 1 秒(原 5 秒)。daemon 内部有指数退避 retry
-                // (1s→30s),首次 detect_cdp 失败会自动重试;5 秒太长导致
-                // 用户开 Codex Desktop 后 Plugins 锁定状态可见时间 ~5s+,
-                // 改 1s 让 daemon 更早 connect + 更早 inject,把"可见
-                // 锁定时间"压到 ~1-2s。
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                let auto_unlock = match crate::admin::registry_io::load() {
+                // [MOC-104] 真实 chatgpt 活动 → Codex 原生显示 plugins,绝不启 daemon
+                // (relay 模式核心:无注入、无不匹配、无 MOC-100 高延迟)。
+                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                    tracing::info!(
+                        "[PluginUnlock] 真实 chatgpt 账号活动,Codex 原生显示 plugins,不启 daemon(relay 模式)"
+                    );
+                    return;
+                }
+
+                // 无真实账号:仅用户显式强制开启(高延迟 CDP 伪造注入)才跑 daemon。
+                // 迁移后默认 false;只有强制开启 / 用户手动开开关才 true。
+                let force_cdp = match crate::admin::registry_io::load() {
                     Ok(cfg) => cfg
                         .get("settings")
                         .and_then(|s| s.get("autoUnlockCodexPlugins"))
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    Err(_) => true,
+                        .unwrap_or(false),
+                    Err(_) => false,
                 };
-
-                if auto_unlock {
-                    tracing::info!("[PluginUnlock] autoUnlockCodexPlugins=true, starting service");
-                    let service = handlers::plugin_unlock::get_service().await;
-                    service.start();
+                if force_cdp {
+                    tracing::info!("[PluginUnlock] 无真实账号 + 用户强制开启(高延迟 CDP),启动 daemon");
+                    handlers::plugin_unlock::get_service().await.start();
                 } else {
-                    tracing::debug!(
-                        "[PluginUnlock] autoUnlockCodexPlugins=false, skipping auto-start"
+                    tracing::info!(
+                        "[PluginUnlock] 无真实账号且未强制开启,不启 daemon(避免默默高延迟)"
                     );
                 }
             });
@@ -320,6 +384,12 @@ fn main() {
                     .await
                 });
                 tracing::info!(target_epoch, "app exit: epoch={target_epoch} 已退出或 timeout");
+            }
+            // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
+            // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
+            // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。
+            if crate::codex_real_account::cancel_login() {
+                tracing::info!("app exit: 已取消 in-flight codex login,防孤儿进程退出后改写 auth.json");
             }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }

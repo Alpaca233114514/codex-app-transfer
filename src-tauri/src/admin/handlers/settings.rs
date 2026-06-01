@@ -430,6 +430,10 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             // [MOC-100 P2-3] autoUnlockCodexPlugins 开关当场生效,无需重启 transfer:
             // 开→start daemon(幂等,已在跑则 no-op);关→stop daemon(gated,没跑则
             // no-op)。否则切到 false 后 daemon 还在跑、切回 true 又得重启才生效。
+            // [MOC-104 relay] 开关 = 强制 CDP daemon 档。真实 chatgpt 活动走 relay 原生
+            // 解锁、**不靠 daemon**(与 main.rs 自启决策一致:真实账号绝不启 daemon,免
+            // MOC-100 高延迟)→ 这里**不再**因 active_is_real_chatgpt_now 而 start。
+            // 开关开(强制档)→ 启 daemon;开关关 → 停(没跑则 no-op)。
             if let Some(enabled) = auto_unlock_changed {
                 let service = crate::admin::handlers::plugin_unlock::get_service().await;
                 if enabled {
@@ -442,6 +446,57 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// [MOC-104] 真实账号失效时自动关「自动解锁 Codex Plugins」开关 + 停 daemon。
+/// 仅在当前为 on 时动作(返回 `true`),避免重复 no-op。复用 save_settings 同款
+/// "开关变更即时停 daemon"逻辑。
+pub async fn disable_auto_unlock_codex_plugins() -> bool {
+    let changed = with_config_write(|cfg| {
+        let was_on = cfg
+            .get("settings")
+            .and_then(|s| s.get("autoUnlockCodexPlugins"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !was_on {
+            return Ok(ConfigMutation::Unchanged(false));
+        }
+        ensure_settings_object(cfg).insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false);
+    if changed {
+        crate::admin::handlers::plugin_unlock::get_service()
+            .await
+            .stop()
+            .await;
+    }
+    changed
+}
+
+/// [MOC-104] 一次性迁移:老版本 `autoUnlockCodexPlugins` 默认 true 直接驱动 CDP 伪造
+/// 注入 daemon —— 但只有活动 auth.json 不是真实 chatgpt 时该注入才造成不匹配 →
+/// Codex 启动重新初始化(高延迟)。真实账号模式上线后,高延迟 CDP 路径改为「显式
+/// 强制开启」才走;升级用户残留的旧 `true` 不该默默把人按在高延迟路径上。
+///
+/// 首次启动检测到没迁移过 → **硬重置 `autoUnlockCodexPlugins=false`**(用户指示),
+/// 之后只有「强制开启」按钮 / 用户手动开开关才会置回 true。幂等:迁移标记已置则
+/// no-op,不会反复覆盖用户后来的选择。返回本次是否执行了重置(供日志)。
+pub fn migrate_real_account_unlock_v1() -> bool {
+    with_config_write(|cfg| {
+        let s = ensure_settings_object(cfg);
+        let already = s
+            .get("realAccountUnlockMigratedV1")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if already {
+            return Ok(ConfigMutation::Unchanged(false));
+        }
+        s.insert("realAccountUnlockMigratedV1".to_owned(), Value::Bool(true));
+        s.insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
 }
 
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。

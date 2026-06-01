@@ -22,6 +22,9 @@ const MANAGED_AUTH_KEYS: &[&str] = &["auth_mode", "OPENAI_API_KEY"];
 /// 我们 apply 时实际触碰的 config.toml 根级别字段(restore 时只动这些)。
 const MANAGED_TOML_KEYS: &[&str] = &[
     "openai_base_url",
+    // [MOC-104 relay] relay 写 chatgpt_base_url 引账号/插件 backend 进 proxy;restore /
+    // 切非 relay 时必须 strip,否则残留让 Codex 卸载后仍把 chatgpt backend 发去 proxy。
+    "chatgpt_base_url",
     "model_context_window",
     CODEX_MODEL_CATALOG_KEY,
     "model",
@@ -92,6 +95,17 @@ pub struct ApplyConfig<'a> {
     /// status-section atom 既不写也不清(留用户原值)。详见 issue #317。
     #[serde(default)]
     pub direct: bool,
+    /// **[MOC-104] relay 模式**:`true` 时 apply **保留**活动 `auth.json` 的真实
+    /// chatgpt 登录态(`auth_mode=chatgpt` + tokens),**不**写 `apikey` /
+    /// `OPENAI_API_KEY`。Codex 据 `auth_mode==chatgpt` 原生显示 Plugins 入口
+    /// (无需 CDP daemon 注入,消除 MOC-100 高延迟);第三方模型请求仍走
+    /// `openai_base_url` → proxy,上游凭据由 proxy 按 provider 配置注入
+    /// (`forward.rs::inject_auth`,与 auth.json 无关)。Caller(src-tauri)在活动
+    /// 已是可用真实 chatgpt 时置 `true`。借鉴 CodexPlusPlus relay 思路(保留
+    /// chatgpt 登录态解锁 plugins),但**不写 `model_provider`**(守用户硬约束),
+    /// 改走现有 `openai_base_url` 根键路径。
+    #[serde(default)]
+    pub preserve_chatgpt_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,6 +130,25 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     } else {
         let literal = toml_string_literal(cfg.base_url);
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
+    }
+
+    // 2a'. [MOC-104 relay 诊断] chatgpt_base_url → proxy
+    //
+    // relay 模式(`preserve_chatgpt_auth`)下,Codex 的**账号/插件/wham** 请求
+    // (getAccount → userId、plugins install/list/read 等)走 `chatgpt_base_url`
+    // (默认 `https://chatgpt.com/backend-api`),**不经** `openai_base_url`,因此
+    // 现在直连 chatgpt.com、过系统代理、TLS 黑盒 —— relay 的「启动延迟未消除 +
+    // plugins 装不上」就卡在这条看不见的链路。把它也指向本 proxy(`base_url` +
+    // `/backend-api`,与默认结构对齐:proxy 收到 `/backend-api/*` 透传真
+    // chatgpt.com 同 path),proxy 即可逐条 log 该链路的请求/响应,把黑盒打开。
+    //
+    // 仅 relay 写;direct / apikey 态 strip(None)。snapshot 已存原值,restore 退回。
+    if cfg.preserve_chatgpt_auth && !cfg.base_url.is_empty() {
+        let chatgpt_base = format!("{}/backend-api", cfg.base_url.trim_end_matches('/'));
+        let literal = toml_string_literal(&chatgpt_base);
+        sync_root_value(&paths.config_toml, "chatgpt_base_url", Some(&literal))?;
+    } else {
+        sync_root_value(&paths.config_toml, "chatgpt_base_url", None)?;
     }
 
     // 2b. **无条件 strip model_provider 字段**(#258 验证后强约束):
@@ -231,7 +264,27 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 4. auth.json: auth_mode + OPENAI_API_KEY
     let mut auth = read_auth(&paths.auth_json)?;
     let obj = auth.as_object_mut().expect("read_auth 保证返回 Object");
-    if cfg.gateway_api_key.is_empty() {
+    // [MOC-104] relay 自校验:caller gate(`active_is_real_chatgpt_now`)与此处重新读盘
+    // 之间 apply 不持 AUTH_LOCK,存在 TOCTOU 窗口(并发 codex login / 切账号可能把活动
+    // 改成 apikey)。只有确认**刚读到的 auth 仍是可用 chatgpt**(auth_mode==chatgpt +
+    // access_token 非空)才走 relay 保留;否则退回 apikey 写入(非破坏),绝不把活动
+    // strip 成「既无 apikey 又无有效 chatgpt token」的无凭据态(守 no-silent-destructive
+    // -fallback)。也让 relay 分支自包含、不盲信单一 caller 的 gate。
+    let preserve_now = cfg.preserve_chatgpt_auth
+        && obj.get("auth_mode").and_then(|v| v.as_str()) == Some("chatgpt")
+        && obj
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+    if preserve_now {
+        // relay 模式:活动确认是可用真实 chatgpt → 保留,**不**写 apikey / OPENAI_API_KEY。
+        // Codex 据 `auth_mode==chatgpt` 原生显示 Plugins 入口(无 CDP daemon、无 MOC-100
+        // 高延迟)。第三方模型请求仍走上面写好的 `openai_base_url` → proxy,上游凭据由
+        // proxy 按 provider 配置注入(forward.rs::inject_auth),与此处 chatgpt token 无关。
+        // 仅清掉既往 apikey 态残留的 OPENAI_API_KEY;本次只删多余 key、不动 chatgpt 凭据。
+        obj.remove("OPENAI_API_KEY");
+    } else if cfg.gateway_api_key.is_empty() {
         obj.remove("OPENAI_API_KEY");
     } else {
         obj.insert(
@@ -597,6 +650,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -623,6 +677,62 @@ mod tests {
         assert_eq!(auth["OPENAI_API_KEY"], "cas_test");
     }
 
+    /// [MOC-104] relay 模式:`preserve_chatgpt_auth=true` 时保留活动 chatgpt 登录态
+    /// (`auth_mode=chatgpt` + tokens),**不**写 apikey,strip 残留 OPENAI_API_KEY;
+    /// config.toml 写 `openai_base_url`(第三方模型经 proxy)**和** `chatgpt_base_url`
+    /// (诊断:Codex 的账号/插件 backend 走 chatgpt_base_url,把它也引到 proxy 透传
+    /// 真 chatgpt.com,见 §2a')。Codex 据 auth_mode==chatgpt 原生显示 Plugins 入口。
+    #[test]
+    fn apply_relay_preserves_chatgpt_auth_and_strips_residual_apikey() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 预置活动 auth.json:真实 chatgpt(带从既往 apikey 态残留的 OPENAI_API_KEY)
+        std::fs::write(
+            &paths.auth_json,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"at","refresh_token":"rt","account_id":"acc"},"last_refresh":"2026-06-01T00:00:00Z","OPENAI_API_KEY":"old_residual"}"#,
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test", // 非空,但 relay 模式忽略它(不写 apikey)
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                app_version: "v2.0.0-stage2.5",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+                direct: false,
+                preserve_chatgpt_auth: true,
+            },
+        )
+        .unwrap();
+
+        let auth = read_auth_value(&paths);
+        // relay:chatgpt 态 + tokens 原子保留
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert_eq!(auth["tokens"]["access_token"], "at");
+        assert_eq!(auth["tokens"]["refresh_token"], "rt");
+        // 不写 gateway apikey;strip 残留 OPENAI_API_KEY(chatgpt 态不该带)
+        assert!(
+            auth.get("OPENAI_API_KEY").is_none(),
+            "relay 应 strip 残留 OPENAI_API_KEY,保持纯 chatgpt 态"
+        );
+        // config.toml 写 openai_base_url → proxy(第三方模型经 proxy 转发)
+        let toml = read_toml(&paths);
+        assert!(toml.contains("openai_base_url = \"http://127.0.0.1:18080\""));
+        // [MOC-104 relay 诊断] chatgpt_base_url 也指 proxy(+/backend-api):账号/插件
+        // backend 经 proxy 透传 chatgpt.com,把 TLS 黑盒链路变可见
+        assert!(
+            toml.contains("chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\""),
+            "relay 应写 chatgpt_base_url → proxy/backend-api: {toml}"
+        );
+    }
+
     /// #212 covering test:**toggle off 时 strip 两条**(sandbox_mode +
     /// network_access),让 Codex 回 default read-only。不能像之前 explicit
     /// 写 false —— 单留 false 仍可能让 sandbox_mode 残留 workspace-write,
@@ -645,6 +755,7 @@ mod tests {
                 codex_network_access: false,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -691,6 +802,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -759,6 +871,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -826,6 +939,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -890,6 +1004,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -930,6 +1045,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -977,6 +1093,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1018,6 +1135,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1038,6 +1156,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1089,6 +1208,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1134,6 +1254,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1198,6 +1319,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1334,6 +1456,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1402,6 +1525,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1422,6 +1546,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1456,6 +1581,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1482,6 +1608,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1515,6 +1642,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1554,6 +1682,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1605,6 +1734,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1659,6 +1789,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1713,6 +1844,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1753,6 +1885,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1853,6 +1986,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -1905,6 +2039,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .expect("apply must not fail when atom file is corrupt — UI preference best-effort");
@@ -1960,6 +2095,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -2025,6 +2161,7 @@ mod tests {
                 codex_network_access: true, // 即便 on,direct 也不写 sandbox
                 codex_status_section_default_visible: true,
                 direct: true,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -2078,6 +2215,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: false,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -2102,6 +2240,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: true,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();
@@ -2163,6 +2302,7 @@ mod tests {
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
                 direct: true,
+                preserve_chatgpt_auth: false,
             },
         )
         .unwrap();

@@ -605,6 +605,35 @@ window.CCApi.pluginUnlock = {
   },
 };
 
+// MOC-104 真实 ChatGPT 账号 plugin 模式
+window.CCApi.realAccount = {
+  /** 检测真实 chatgpt 登录态 + 登录流程状态 */
+  async status() {
+    return api('GET', '/api/desktop/real-account/status');
+  },
+  /** 在 transfer 内调起官方 codex login(非阻塞,弹浏览器做 OAuth) */
+  async login() {
+    return api('POST', '/api/desktop/real-account/login');
+  },
+  /** 取消进行中的登录 */
+  async loginCancel() {
+    return api('POST', '/api/desktop/real-account/login/cancel');
+  },
+  /** 从文件导入真实账号(sourcePath = Tauri dialog 选的源文件绝对路径;后端读该路径
+   * 文件、记录源路径,reconcile 可从活源跟随刷新) */
+  async import(sourcePath) {
+    return api('POST', '/api/desktop/real-account/import', { source_path: sourcePath });
+  },
+  /** 钉住当前检测到的真实账号(持久保留) */
+  async pinCurrent() {
+    return api('POST', '/api/desktop/real-account/pin-current');
+  },
+  /** 忘记导入的真实账号(删持久镜像) */
+  async forget() {
+    return api('POST', '/api/desktop/real-account/forget');
+  },
+};
+
 window.CCApi.theme = {
   /** 列出内置主题(#264) */
   async list() {
