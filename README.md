@@ -69,9 +69,9 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - **用量统计**(Sidebar → 用量):解析 `~/.codex/sessions/` rollout JSONL,按对话 / 日 / 模型聚合 token 用量(解析层 vendor 自 ryoppippi/ccusage)。「按对话」视图显示每对话**缓存命中率**,点击数字弹出该对话**逐轮命中率直方图**(命中含于总计、双色,hover 看命中 / 总输入 / 输出);proxy 本地记录 `session → 真实上游模型`(本版本之后的新对话),「按对话」模型列因此显示真实上游模型而非 Codex 客户端占位名(`gpt-5.x`)
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原;**MCP 授权可移植保险箱**(默认开):把 MCP OAuth 凭据改存为可移植文件(`~/.codex/.credentials.json`,0o600),并在 `~/.codex` 之外维护镜像(`~/.codex-app-transfer/mcp-credentials.json`);整个凭据文件被账号切换 / 误删 / 换机清掉时,下次启动弹确认让你从备份恢复(单个 server 的主动登出会被尊重、不复活;注:不解决 OAuth 自然过期)
 - **Codex 文档管理**(Sidebar → Codex):
-  - **Agents**:任意位置 `AGENTS.md` raw 全文 read/write + 文件系统选择;按 `.git/` 自动分类 project-root / subdir 显示 chip
-  - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要)— codex 唯二 user-editable 的 AI 实际读取索引
-  - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
+  - **Agents**:HOME 下非敏感 `AGENTS.md` raw 全文 read/write + 文件系统选择;系统目录 / 凭据目录会被拒绝,按 `.git/` 自动分类 project-root / subdir 显示 chip
+  - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要),也可添加 HOME 下非敏感项目 `MEMORY.md`;系统目录 / 凭据目录会被拒绝
+  - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑,并强制限制在 skills 根目录内;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
   - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径)
 - 实时日志面板,2 秒自动刷新;统一 `tracing::warn!(error_id, detail)` + 稳定 token,operator 可 grep / 聚合
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料
