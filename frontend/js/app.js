@@ -2580,6 +2580,14 @@
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
+    if ($("#webFetchBackend")) {
+      const _wfb = settings.webFetchBackend || "off";
+      // segmented 按钮组: 高亮当前档 + 记下"已保存值"供切换失败/取消时回退。
+      $("#webFetchBackend").dataset.saved = _wfb;
+      $all("#webFetchBackend .btn").forEach((b) =>
+        b.classList.toggle("active", b.dataset.webfetch === _wfb)
+      );
+    }
     $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
@@ -3119,6 +3127,7 @@
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
+      webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "off",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
@@ -8372,6 +8381,82 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
+    // MOC-144 联网抓取后端: segmented 按钮组(不用原生 <select>, 避免下拉 popup 遮挡下方文字)。
+    // 回退目标 = #webFetchBackend.dataset.saved("上次成功保存值", load + 每次成功 save 后更新);
+    // _webFetchSwitching 作 in-flight guard, 防 20s 下载期间重复点触发并发。
+    const _webFetchSeg = $("#webFetchBackend");
+    let _webFetchSwitching = false;
+    const _webFetchSaved = () => _webFetchSeg?.dataset.saved || "off";
+    const _setWebFetchActive = (v) =>
+      $all("#webFetchBackend .btn").forEach((b) =>
+        b.classList.toggle("active", b.dataset.webfetch === v)
+      );
+    // 存档选中档: 成功更新 dataset.saved; 失败回退高亮 + 明确"设置保存失败"(区分"下载失败")。
+    async function _commitWebFetch(v) {
+      _setWebFetchActive(v);
+      try {
+        await saveSettingsFromForm();
+        _webFetchSeg.dataset.saved = v;
+        return true;
+      } catch (e) {
+        _setWebFetchActive(_webFetchSaved());
+        showToast(t("settings.webFetchSaveFailed") + (e?.message ? `: ${e.message}` : ""));
+        return false;
+      }
+    }
+    $all("#webFetchBackend .btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const v = btn.dataset.webfetch;
+        if (_webFetchSwitching || v === _webFetchSaved()) return; // 切换中 / 没变 → 忽略
+        if (v !== "headless") {
+          await _commitWebFetch(v);
+          return;
+        }
+        // 选 headless: 探测系统 Chrome(加 guard; 先视觉高亮目标)
+        _webFetchSwitching = true;
+        _setWebFetchActive("headless");
+        let pendingModal = false;
+        try {
+          const r = await CCApi.detectSystemChrome();
+          if (r.detected) {
+            if (await _commitWebFetch("headless")) showToast(t("settings.headlessChromeSystemFound"));
+          } else {
+            pendingModal = true; // 未装 → 弹窗, guard 保持到 confirm/cancel 收尾
+            $("#headlessChromeDownloadModal").hidden = false;
+          }
+        } catch (e) {
+          _setWebFetchActive(_webFetchSaved()); // 探测失败回退
+          showToast(e?.message || t("settings.headlessChromeFailed"));
+        } finally {
+          if (!pendingModal) _webFetchSwitching = false;
+        }
+      });
+    });
+    $("[data-action=headless-chrome-confirm]")?.addEventListener("click", async () => {
+      $("#headlessChromeDownloadModal").hidden = true;
+      showToast(t("settings.headlessChromeDownloading"));
+      try {
+        await CCApi.ensureChromeHeadlessShell();
+      } catch (e) {
+        // 下载本身失败 → 回退高亮, 报"下载失败"
+        showToast(e?.message || t("settings.headlessChromeFailed"));
+        _setWebFetchActive(_webFetchSaved());
+        _webFetchSwitching = false;
+        return;
+      }
+      // 下载成功 → 独立存档(失败由 _commitWebFetch 报"设置保存失败", 不误报"下载失败")
+      if (await _commitWebFetch("headless")) showToast(t("settings.headlessChromeDownloaded"));
+      _webFetchSwitching = false;
+    });
+    // 两个 cancel 触发器(✕ + 文字"取消")都要绑(沿用 real-account modal 的 $all 范式,
+    // $ 只绑第一个会让文字"取消"按钮失效 — devin review)。
+    $all("[data-action=headless-chrome-cancel]").forEach((b) =>
+      b.addEventListener("click", () => {
+        $("#headlessChromeDownloadModal").hidden = true;
+        _setWebFetchActive(_webFetchSaved()); // 取消回退到上次保存值
+        _webFetchSwitching = false;
+      })
+    );
     $("#codexStatusSectionDefaultVisible")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
