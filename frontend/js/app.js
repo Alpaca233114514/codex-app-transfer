@@ -2571,9 +2571,10 @@
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
    // [MOC-104] 持久强制档初值;refreshRealAccountStatus 随后按 realActive 派生修正
    // (有账号→ON、无账号→强制档值)。migrate 后默认 false → 无账号时初始 OFF。
-   forceUnlockPersisted = settings.autoUnlockCodexPlugins === true;
+    forceUnlockPersisted = settings.autoUnlockCodexPlugins === true;
    $("#autoUnlockCodexPlugins").checked = forceUnlockPersisted;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
+    $("#suppressCodexPetFocusSteal").checked = settings.suppressCodexPetFocusSteal !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     showGrayPresets = settings.showGrayProviders === true;
     $("#showGrayProviders").checked = showGrayPresets;
@@ -3114,6 +3115,7 @@
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
      autoUnlockCodexPlugins: forceUnlockPersisted,
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
+      suppressCodexPetFocusSteal: $("#suppressCodexPetFocusSteal")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       showGrayProviders: $("#showGrayProviders")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
@@ -8276,6 +8278,7 @@
     $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
    $("#autoUnlockCodexPlugins")?.addEventListener("change", onAutoUnlockToggle);
     $("#autoWakeCodexPet")?.addEventListener("change", saveSettingsFromForm);
+    $("#suppressCodexPetFocusSteal")?.addEventListener("change", saveSettingsFromForm);
     $("#mcpCredentialsPortableStore")?.addEventListener("change", saveSettingsFromForm);
 
    // Plugin Unlock 按钮事件

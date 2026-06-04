@@ -61,6 +61,7 @@ pub(super) fn default_config_value() -> Value {
            "mcpCredentialsPortableStore": true,
            "autoUnlockCodexPlugins": false,
             "autoWakeCodexPet": true,
+           "suppressCodexPetFocusSteal": true,
            "updateUrl": DEFAULT_UPDATE_URL
         }
     })
@@ -393,6 +394,10 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(|s| s.get("autoUnlockCodexPlugins"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let old_pet_focus_patch = cfg
+            .get("settings")
+            .map(crate::codex_pet_focus_patch::suppress_pet_focus_steal_enabled)
+            .unwrap_or(true);
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -410,14 +415,19 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let auto_unlock_changed = (new_auto_unlock != old_auto_unlock).then_some(new_auto_unlock);
+        let new_pet_focus_patch =
+            crate::codex_pet_focus_patch::suppress_pet_focus_steal_enabled(&settings);
+        let pet_focus_patch_changed =
+            (new_pet_focus_patch != old_pet_focus_patch).then_some(new_pet_focus_patch);
         Ok(ConfigMutation::Modified((
             settings,
             portable_changed,
             auto_unlock_changed,
+            pet_focus_patch_changed,
         )))
     });
     match result {
-        Ok((settings, portable_changed, auto_unlock_changed)) => {
+        Ok((settings, portable_changed, auto_unlock_changed, pet_focus_patch_changed)) => {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
@@ -441,6 +451,20 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
                 } else {
                     service.stop().await;
                 }
+            }
+            if pet_focus_patch_changed == Some(true) {
+                tokio::spawn(async {
+                    match crate::codex_pet_focus_patch::apply_if_enabled().await {
+                        Ok(count) => tracing::info!(
+                            count,
+                            "[PetFocusPatch] settings enabled, best-effort inject completed"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "[PetFocusPatch] settings enabled, best-effort inject failed"
+                        ),
+                    }
+                });
             }
             Json(json!({"success": true, "settings": settings})).into_response()
         }

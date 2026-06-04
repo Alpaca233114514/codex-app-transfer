@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin;
+mod codex_pet_focus_patch;
 mod codex_plugin_unlocker;
 mod codex_real_account;
 mod codex_theme_injector;

@@ -419,7 +419,12 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexUiThemeEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled {
+    let pet_focus_patch_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .map(crate::codex_pet_focus_patch::suppress_pet_focus_steal_enabled)
+        .unwrap_or(true);
+    if !plugin_unlock_needs_port && !theme_enabled && !pet_focus_patch_enabled {
         return vec![];
     }
 
@@ -443,6 +448,7 @@ fn should_attach_debug_port() -> Vec<String> {
                 crate::codex_plugin_unlocker::CDP_PORT
                     .store(port, std::sync::atomic::Ordering::Relaxed);
                 auto_apply_theme_on_startup().await;
+                auto_apply_pet_focus_patch_on_startup().await;
             } else {
                 // **不**写 stale 9222 进 CDP_PORT — Codex 启动传 `--remote-debugging-port=0`,
                 // Chromium 选了某个真实端口但 DevToolsActivePort 文件没出现(可能 sandbox /
@@ -494,11 +500,12 @@ fn should_attach_debug_port() -> Vec<String> {
         //    ② try_bind 预检端口与 Codex 实际监听端口是否一致。验证前开启此尝试是
         //    安全的,但"能否真正生效"取决于上述两点;若实测无效,需改走类似 macOS 的
         //    端口探测(Win 无 DevToolsActivePort,可能要别的就绪信号)。
-        if theme_enabled {
+        if theme_enabled || pet_focus_patch_enabled {
             tokio::spawn(async {
                 // Codex Desktop 冷启动较慢(尤其 Windows MSIX),给 ~2s grace 再尝试。
                 tokio::time::sleep(Duration::from_millis(2000)).await;
                 auto_apply_theme_on_startup().await;
+                auto_apply_pet_focus_patch_on_startup().await;
             });
         }
         return vec![
@@ -577,6 +584,40 @@ async fn auto_apply_theme_on_startup() {
         theme_id = %theme_id,
         "[Theme] auto-apply gave up after 3 attempts (user can still apply manually)"
     );
+}
+
+async fn auto_apply_pet_focus_patch_on_startup() {
+    if !crate::codex_pet_focus_patch::suppress_pet_focus_steal_enabled_from_registry() {
+        return;
+    }
+    for attempt in 0..3u32 {
+        let delay_ms = 300 + (attempt as u64) * 500;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        match crate::codex_pet_focus_patch::apply_if_enabled().await {
+            Ok(count) if count > 0 => {
+                tracing::info!(
+                    count,
+                    attempt,
+                    "[PetFocusPatch] auto-applied on Codex startup"
+                );
+                return;
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    attempt,
+                    "[PetFocusPatch] avatar overlay not found during startup attempt"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    "[PetFocusPatch] auto-apply attempt failed, retrying"
+                );
+            }
+        }
+    }
+    tracing::warn!("[PetFocusPatch] auto-apply gave up after 3 attempts");
 }
 
 /// 读 transfer settings,看 user 是否开了 theme + 选了哪个。返 `None` =
