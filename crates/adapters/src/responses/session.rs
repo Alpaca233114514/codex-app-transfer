@@ -219,11 +219,11 @@ impl ResponseSessionCache {
     /// **彻底清除**:L1 内存 + L2 sqlite 表。给 admin endpoint
     /// `POST /api/sessions/clear` 用。返回清掉的 L2 行数(L1 总是清空)。
     pub fn clear_all_persisted(&self) -> Result<usize, String> {
-        self.clear();
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
-            return Ok(0);
+            return Err("db unavailable: cannot clear persisted sessions".to_string());
         };
+        self.clear();
         conn.execute("DELETE FROM response_sessions", [])
             .map_err(|e| {
                 let detail = format!("clear failed: {e}");
@@ -744,6 +744,34 @@ mod tests {
             &path,
         );
         assert!(cache2.get("resp_x").is_none());
+    }
+
+    #[test]
+    fn clear_with_db_none_errors_and_preserves_blobs() {
+        // db=None 时 clear_all_persisted 必须返回 Err,不能清 L1 后返回 Ok(0)
+        let dir = tempfile::tempdir().unwrap();
+        let blocker_file = dir.path().join("blocker");
+        std::fs::write(&blocker_file, b"x").unwrap();
+        let bad_path = blocker_file.join("sessions.db");
+
+        let (cache, warn) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &bad_path,
+        );
+        assert!(warn.is_some(), "db init 应失败,得到 {warn:?}");
+
+        // 先存一条数据到 L1
+        cache.save("resp_x", vec![json!({"role": "user", "content": "x"})]);
+        assert!(cache.get("resp_x").is_some(), "save 后 L1 应有数据");
+
+        // db=None → clear_all_persisted 必须返回 Err,不是 Ok(0)
+        let result = cache.clear_all_persisted();
+        assert!(result.is_err(), "db=None 时 clear_all_persisted 必须返回 Err,实际 {result:?}");
+
+        // L1 数据必须保留(没有因为 self.clear() 被误清)
+        assert!(cache.get("resp_x").is_some(), "db=None 时 L1 数据必须保留");
     }
 
     #[test]
